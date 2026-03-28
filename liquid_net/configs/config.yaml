@@ -1,0 +1,45 @@
+# Twistor-inspired Liquid Neural Network Configuration
+
+# Model parameters
+model:
+  input_dim: 2
+  hidden_dim: 16
+  output_dim: 1
+  dt: 0.1  # Time step for Euler integration
+
+# Training parameters
+training:
+  n_epochs: 200
+  batch_size: 32
+  lr: 0.01
+  stability_weight: 0.01
+  device: "cpu"  # or "cuda" if available
+
+# Dataset parameters
+dataset:
+  n_samples_train: 1000
+  n_samples_val: 200
+  seq_len: 50
+  noise_std: 0.1
+
+# Optimizer parameters
+optimizer:
+  type: "adam"
+  lr: 0.01
+  weight_decay: 0.0
+
+# Scheduler parameters
+scheduler:
+  type: "ReduceLROnPlateau"
+  patience: 20
+  factor: 0.5
+
+# Logging
+logging:
+  print_every: 20
+  save_model: true
+  model_path: "twistor_lnn.pth"
+  plot_curves: true
+  curves_path: "training_curves.png"
+  plot_predictions: true
+  predictions_path: "predictions.png"
