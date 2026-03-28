@@ -29,24 +29,48 @@ class TwistorAgent:
     - Stateful interaction with environment
     - Action selection from observations
     - Reset functionality for new episodes
+
+    Can be initialized in two ways:
+    1. With a pre-created model: TwistorAgent(model)
+    2. With dimensions: TwistorAgent(obs_dim=4, action_dim=2, hidden_dim=32)
     """
 
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module = None,
         device: str = "cpu",
+        obs_dim: int = None,
+        action_dim: int = None,
+        hidden_dim: int = 32,
     ):
         """
         Initialize agent.
 
         Args:
-            model: TwistorLNN model
+            model: TwistorLNN model (or None if using obs_dim/action_dim)
             device: Device for computation
+            obs_dim: Observation dimension (if model not provided)
+            action_dim: Action dimension (if model not provided)
+            hidden_dim: Hidden dimension (if model not provided)
         """
+        # If model not provided, create one from dimensions
+        if model is None:
+            if obs_dim is None or action_dim is None:
+                raise ValueError(
+                    "Either model or (obs_dim, action_dim) must be provided"
+                )
+            from .core import TwistorLNN
+
+            model = TwistorLNN(
+                input_dim=obs_dim, hidden_dim=hidden_dim, output_dim=action_dim
+            )
+
         self.model = model
         self.device = device
         self.z = None
         self.hidden_dim = model.hidden_dim
+        self.obs_dim = model.input_dim
+        self.action_dim = model.output_dim
 
     def reset(self, batch_size: int = 1) -> torch.Tensor:
         """

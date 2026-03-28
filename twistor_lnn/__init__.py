@@ -50,8 +50,21 @@ from .visualization import (
     plot_stability_analysis,
     plot_training_diagnostics,
 )
+from .datasets import (
+    generate_lorenz_dataset,
+    generate_mackey_glass_dataset,
+    generate_van_der_pol_dataset,
+    generate_sine_dataset,
+    create_dataset,
+)
+from .training import (
+    train_model,
+    train_on_task,
+    plot_training_results,
+    plot_predictions,
+)
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     # ========== Core ==========
@@ -95,4 +108,15 @@ __all__ = [
     "plot_complex_plane",
     "plot_stability_analysis",
     "plot_training_diagnostics",
+    # ========== Datasets ==========
+    "generate_lorenz_dataset",
+    "generate_mackey_glass_dataset",
+    "generate_van_der_pol_dataset",
+    "generate_sine_dataset",
+    "create_dataset",
+    # ========== Training ==========
+    "train_model",
+    "train_on_task",
+    "plot_training_results",
+    "plot_predictions",
 ]
