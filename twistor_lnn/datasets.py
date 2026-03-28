@@ -122,22 +122,25 @@ def generate_mackey_glass_dataset(
     X = []
     y = []
 
+    # Total steps needed: warmup + seq_len + 1 (for target)
+    total_steps = tau + 100 + seq_len + 1
+
     for _ in range(n_samples):
-        # Initialize
-        x = np.zeros(seq_len + tau + 100)
+        # Initialize history
+        x = np.zeros(total_steps)
         x[: tau + 100] = n0 + np.random.randn(tau + 100) * 0.01
 
-        # Generate
-        for i in range(tau + 100, len(x) - 1):
+        # Generate trajectory
+        for i in range(tau + 100, total_steps - 1):
             x[i + 1] = x[i] + dt * (
                 beta * x[i - tau] / (1 + x[i - tau] ** n0) - gamma * x[i]
             )
 
-        # Add noise and take segment
-        x = x[tau + 100 :] + np.random.randn(seq_len + 1) * noise_std
+        # Add noise and extract sequences
+        x_noisy = x[tau + 100 :] + np.random.randn(seq_len + 1) * noise_std
 
-        X.append(x[:-1].reshape(-1, 1))
-        y.append(x[1:].reshape(-1, 1))
+        X.append(x_noisy[:-1].reshape(-1, 1))
+        y.append(x_noisy[1:].reshape(-1, 1))
 
     X = torch.FloatTensor(np.stack(X)).to(device)
     y = torch.FloatTensor(np.stack(y)).to(device)
