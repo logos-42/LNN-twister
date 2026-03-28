@@ -1,31 +1,23 @@
 """
 Twistor-inspired Liquid Neural Network - Main network module.
-Stability-optimized version.
+Supports multiple integration methods: Euler, RK4, and torchdiffeq ODE solvers.
 
 Core dynamics: dz/dt = (-z + W*tanh(z) + U*x + b) / tau(z)
-
-Stability features:
-- Clamped tau (tau_min, tau_max)
-- Normalized dz/dt
-- Clamped z state
-- Tunable dt
-- NaN/Inf detection
-- L2 regularization support
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List, Optional
 from .ltc_cell import LTCCell
+from ..solvers.rk4 import RK4Integrator
 
 
 class TwistorLNN(nn.Module):
     """
     Twistor-inspired Liquid Neural Network with complex-valued states.
-    Stability-optimized version.
+    Supports Euler and RK4 integration methods.
 
-    The network uses Euler integration to evolve the complex hidden state
-    over time, following the dynamics:
+    The network evolves the complex hidden state over time following:
         dz/dt = (-z + W*tanh(z) + U*x + b) / tau(z)
 
     Key features:
@@ -34,8 +26,7 @@ class TwistorLNN(nn.Module):
         - Bias terms b for both real and imag parts
         - Input U*x affects both real and imag parts
         - Output from real part only
-        - Euler integration with tunable dt
-        - Stability monitoring and diagnostics
+        - Euler or RK4 integration
     """
 
     def __init__(
@@ -48,6 +39,7 @@ class TwistorLNN(nn.Module):
         tau_max: float = 1.0,
         dzdt_max: float = 10.0,
         z_max: float = 100.0,
+        integration_method: str = 'euler',  # 'euler' or 'rk4'
     ):
         """
         Initialize Twistor LNN.
@@ -56,11 +48,12 @@ class TwistorLNN(nn.Module):
             input_dim: Dimension of input features
             hidden_dim: Dimension of hidden state (default: 16)
             output_dim: Dimension of output (default: 1)
-            dt: Time step for Euler integration (default: 0.1)
+            dt: Time step for integration (default: 0.1)
             tau_min: Minimum time constant (default: 0.01)
             tau_max: Maximum time constant (default: 1.0)
             dzdt_max: Maximum |dz/dt| (default: 10.0)
             z_max: Maximum |z| state (default: 100.0)
+            integration_method: 'euler' or 'rk4' (default: 'euler')
         """
         super().__init__()
         self.input_dim = input_dim
@@ -71,6 +64,7 @@ class TwistorLNN(nn.Module):
         self.tau_max = tau_max
         self.dzdt_max = dzdt_max
         self.z_max = z_max
+        self.integration_method = integration_method
 
         # Core dynamics cell
         self.cell = LTCCell(
@@ -80,6 +74,9 @@ class TwistorLNN(nn.Module):
             tau_max=tau_max,
             dzdt_max=dzdt_max,
         )
+
+        # RK4 integrator
+        self.rk4 = RK4Integrator(dt=dt)
 
         # Output projection (real part only)
         self.out = nn.Linear(hidden_dim, output_dim)
@@ -91,7 +88,7 @@ class TwistorLNN(nn.Module):
         return_diagnostics: bool = False
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Forward pass with Euler integration and stability monitoring.
+        Forward pass with selectable integration method.
 
         Args:
             x: Input sequence (T, B, input_dim)
@@ -100,16 +97,80 @@ class TwistorLNN(nn.Module):
 
         Returns:
             y: Output sequence (T, B, output_dim)
-            states: All hidden states (T, B, hidden_dim) if return_states=True
+            states: All hidden states if return_states=True
             diagnostics: Stability info if return_diagnostics=True
         """
+        if self.integration_method == 'rk4':
+            y, states = self._rk4_forward(x)
+        else:
+            y, states = self._euler_forward(x)
+
+        if not return_states and not return_diagnostics:
+            return y
+
+        result = [y]
+        
+        if return_states:
+            result.append(states)
+        
+        if return_diagnostics:
+            diagnostics = self._compute_diagnostics(states)
+            result.append(diagnostics)
+
+        return tuple(result) if len(result) > 1 else result[0]
+
+    def _euler_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward pass with Euler integration."""
         T, B, _ = x.shape
-
-        # Initialize complex hidden state to zero
         z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
-
+        
         outputs = []
-        states = []
+        states = [z]
+
+        for t in range(T):
+            dzdt = self.cell(z, x[t])
+            z = z + self.dt * dzdt
+            
+            # Clamp z
+            z = torch.complex(
+                torch.clamp(z.real, -self.z_max, self.z_max),
+                torch.clamp(z.imag, -self.z_max, self.z_max)
+            )
+            
+            y_t = self.out(z.real)
+            outputs.append(y_t)
+            states.append(z)
+
+        return torch.stack(outputs, dim=0), states
+
+    def _rk4_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward pass with RK4 integration."""
+        T, B, _ = x.shape
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        outputs = []
+        states = [z]
+
+        def dzdt_func(z_state, x_input):
+            return self.cell(z_state, x_input)
+
+        for t in range(T):
+            z = self.rk4.step(dzdt_func, z, x[t], t)
+            
+            # Clamp z
+            z = torch.complex(
+                torch.clamp(z.real, -self.z_max, self.z_max),
+                torch.clamp(z.imag, -self.z_max, self.z_max)
+            )
+            
+            y_t = self.out(z.real)
+            outputs.append(y_t)
+            states.append(z)
+
+        return torch.stack(outputs, dim=0), states
+
+    def _compute_diagnostics(self, states: List[torch.Tensor]) -> Dict:
+        """Compute diagnostic information from states."""
         diagnostics = {
             'z_norm': [],
             'dzdt_norm': [],
@@ -119,63 +180,30 @@ class TwistorLNN(nn.Module):
             'has_inf': False,
         }
 
-        # Time loop: Euler integration
-        for t in range(T):
-            x_t = x[t]
-
-            # Compute time derivative
-            dzdt = self.cell(z, x_t)
-
-            # Check for numerical issues
-            stability_check = self.cell.check_stability(z, dzdt)
-            if stability_check['z_nan'] or stability_check['z_inf']:
-                diagnostics['has_nan'] = stability_check['z_nan']
-                diagnostics['has_inf'] = stability_check['z_inf']
-
-            # Record diagnostics
-            if return_diagnostics:
-                diagnostics['z_norm'].append(torch.abs(z).mean().item())
+        for i, z in enumerate(states):
+            diagnostics['z_norm'].append(torch.abs(z).mean().item())
+            
+            if i < len(states) - 1:
+                dzdt = (states[i + 1] - z) / self.dt
                 diagnostics['dzdt_norm'].append(torch.abs(dzdt).mean().item())
+            
+            tau = self.cell.compute_tau(z)
+            diagnostics['tau_mean'].append(tau.mean().item())
+            diagnostics['tau_std'].append(tau.std().item())
+            
+            if torch.isnan(z).any() or torch.isinf(z).any():
+                diagnostics['has_nan'] = True
+                diagnostics['has_inf'] = True
 
-            # Euler step: z(t+dt) = z(t) + dt * dz/dt
-            z = z + self.dt * dzdt
+        diagnostics['z_norm'] = torch.tensor(diagnostics['z_norm'])
+        diagnostics['dzdt_norm'] = torch.tensor(diagnostics['dzdt_norm'])
+        diagnostics['tau_mean'] = torch.tensor(diagnostics['tau_mean'])
+        diagnostics['tau_std'] = torch.tensor(diagnostics['tau_std'])
 
-            # Clamp z to prevent explosion
-            z = torch.clamp(z, -self.z_max, self.z_max)
-
-            # Record tau diagnostics
-            if return_diagnostics:
-                tau_t = self.cell.compute_tau(z)
-                diagnostics['tau_mean'].append(tau_t.mean().item())
-                diagnostics['tau_std'].append(tau_t.std().item())
-
-            # Output from real part only
-            y_t = self.out(z.real)
-
-            outputs.append(y_t)
-            if return_states:
-                states.append(z)
-
-        # Stack outputs
-        y = torch.stack(outputs, dim=0)
-
-        result = [y]
-        
-        if return_states:
-            states = torch.stack(states, dim=0)
-            result.append(states)
-        
-        if return_diagnostics:
-            diagnostics['z_norm'] = torch.tensor(diagnostics['z_norm'])
-            diagnostics['dzdt_norm'] = torch.tensor(diagnostics['dzdt_norm'])
-            diagnostics['tau_mean'] = torch.tensor(diagnostics['tau_mean'])
-            diagnostics['tau_std'] = torch.tensor(diagnostics['tau_std'])
-            result.append(diagnostics)
-
-        return tuple(result) if len(result) > 1 else result[0]
+        return diagnostics
 
     def get_tau_statistics(self, z: torch.Tensor) -> Dict[str, float]:
-        """Get statistics of time constant tau for a given state."""
+        """Get statistics of time constant tau."""
         tau = self.cell.compute_tau(z)
         return {
             'tau_mean': tau.mean().item(),

@@ -1,107 +1,18 @@
 """
-Twistor-LNN Integrators Module
-===============================
-Numerical integration methods for ODE dynamics.
+Twistor-LNN Additional Integrators Module
+========================================
+Additional numerical integration methods.
 
-Methods:
-- Euler: First-order, simple but less accurate
-- RK4: Fourth-order Runge-Kutta, more accurate
-- Heun: Second-order, balance between speed and accuracy
+Note: Main implementations (Euler, RK4, ODESolver) are in liquid_net.solvers.
+This module provides additional methods and convenience wrappers.
+
+Additional Methods:
+- Heun: Second-order method
+- DOPRI5: Dormand-Prince 5th order
 """
 
 import torch
 from typing import Callable, Optional
-
-
-def euler_step(
-    dzdt_fn: Callable, z: torch.Tensor, x: torch.Tensor, dt: float, *args, **kwargs
-) -> torch.Tensor:
-    """
-    Euler integration (first-order).
-
-    z(t+dt) = z(t) + dt * dz/dt
-
-    Args:
-        dzdt_fn: Function computing dz/dt
-        z: Current state
-        x: Input
-        dt: Time step
-        *args, **kwargs: Additional arguments for dzdt_fn
-
-    Returns:
-        z_next: Next state
-    """
-    dzdt = dzdt_fn(z, x, *args, **kwargs)
-    return z + dt * dzdt
-
-
-def rk4_step(
-    dzdt_fn: Callable, z: torch.Tensor, x: torch.Tensor, dt: float, *args, **kwargs
-) -> torch.Tensor:
-    """
-    Runge-Kutta 4th order integration.
-
-    More accurate than Euler, better for complex dynamics.
-
-    Args:
-        dzdt_fn: Function computing dz/dt
-        z: Current state
-        x: Input
-        dt: Time step
-        *args, **kwargs: Additional arguments for dzdt_fn
-
-    Returns:
-        z_next: Next state
-    """
-    k1 = dzdt_fn(z, x, *args, **kwargs)
-    k2 = dzdt_fn(z + 0.5 * dt * k1, x, *args, **kwargs)
-    k3 = dzdt_fn(z + 0.5 * dt * k2, x, *args, **kwargs)
-    k4 = dzdt_fn(z + dt * k3, x, *args, **kwargs)
-
-    return z + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-
-def rk4_adaptive_step(
-    dzdt_fn: Callable,
-    z: torch.Tensor,
-    x: torch.Tensor,
-    dt: float,
-    tolerance: float = 1e-6,
-    *args,
-    **kwargs,
-) -> torch.Tensor:
-    """
-    Adaptive RK4 with step size control.
-
-    Uses RK4 and RK2 to estimate error and adjust step size.
-
-    Args:
-        dzdt_fn: Function computing dz/dt
-        z: Current state
-        x: Input
-        dt: Time step
-        tolerance: Error tolerance
-
-    Returns:
-        z_next: Next state
-    """
-    k1 = dzdt_fn(z, x, *args, **kwargs)
-    k2 = dzdt_fn(z + 0.5 * dt * k1, x, *args, **kwargs)
-    k3 = dzdt_fn(z + 0.5 * dt * k2, x, *args, **kwargs)
-    k4 = dzdt_fn(z + dt * k3, x, *args, **kwargs)
-
-    z_rk4 = z + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-    k2_simple = dzdt_fn(z + dt * k1, x, *args, **kwargs)
-    z_rk2 = z + dt * k2_simple
-
-    error = torch.abs(z_rk4 - z_rk2).max()
-
-    if error > tolerance:
-        dt_new = dt * (tolerance / error).clamp(0.1, 2.0)
-        return rk4_adaptive_step(dzdt_fn, z, x, dt_new, tolerance, *args, **kwargs)
-
-    return z_rk4
 
 
 def heun_step(
@@ -117,13 +28,13 @@ def heun_step(
         z: Current state
         x: Input
         dt: Time step
+        *args, **kwargs: Additional arguments
 
     Returns:
         z_next: Next state
     """
     k1 = dzdt_fn(z, x, *args, **kwargs)
     k2 = dzdt_fn(z + dt * k1, x, *args, **kwargs)
-
     return z + (dt / 2) * (k1 + k2)
 
 
@@ -133,7 +44,7 @@ def dopri5_step(
     """
     Dormand-Prince (DOPRI5) - 5th order method.
 
-    Commonly used in ODE solvers (e.g., dopri5 in scipy).
+    Commonly used in ODE solvers.
 
     Args:
         dzdt_fn: Function computing dz/dt
@@ -144,7 +55,9 @@ def dopri5_step(
     Returns:
         z_next: Next state
     """
-    c = torch.tensor([0, 1 / 5, 3 / 10, 4 / 5, 8 / 9, 1, 1])
+    c = torch.tensor(
+        [0, 1 / 5, 3 / 10, 4 / 5, 8 / 9, 1, 1], device=z.device, dtype=z.dtype
+    )
     a = torch.tensor(
         [
             [0, 0, 0, 0, 0, 0],
@@ -154,9 +67,15 @@ def dopri5_step(
             [19372 / 6561, -25360 / 2187, 64448 / 6561, -212 / 729, 0, 0],
             [9017 / 3168, -355 / 33, 46732 / 5247, 49 / 176, -5103 / 18656, 0],
             [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84],
-        ]
+        ],
+        device=z.device,
+        dtype=z.dtype,
     )
-    b = torch.tensor([35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0])
+    b = torch.tensor(
+        [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0],
+        device=z.device,
+        dtype=z.dtype,
+    )
 
     k = []
     k.append(dzdt_fn(z, x, *args, **kwargs))
@@ -171,19 +90,21 @@ def dopri5_step(
 class Integrator:
     """
     Integration method wrapper.
+
+    Note: For full solver functionality, use ODESolver from liquid_net.solvers.
     """
 
     METHODS = {
-        "euler": euler_step,
-        "rk4": rk4_step,
+        "euler": None,  # Use liquid_net.solvers.euler_step
+        "rk4": None,  # Use liquid_net.solvers.RK4Integrator
         "heun": heun_step,
         "dopri5": dopri5_step,
     }
 
     def __init__(self, method: str = "rk4"):
-        if method not in self.METHODS:
+        if method not in self.METHODS and method not in ["euler", "rk4"]:
             raise ValueError(f"Unknown method: {method}")
-        self.method = self.METHODS[method]
+        self.method = method
         self.method_name = method
 
     def step(
@@ -196,20 +117,21 @@ class Integrator:
         **kwargs,
     ) -> torch.Tensor:
         """Single integration step."""
-        return self.method(dzdt_fn, z, x, dt, *args, **kwargs)
+        if self.method == "heun":
+            return heun_step(dzdt_fn, z, x, dt, *args, **kwargs)
+        elif self.method == "dopri5":
+            return dopri5_step(dzdt_fn, z, x, dt, *args, **kwargs)
+        else:
+            raise NotImplementedError(f"Use liquid_net.solvers for {self.method}")
 
     def __call__(self, *args, **kwargs):
         return self.step(*args, **kwargs)
 
 
-def create_integrator(method: str = "rk4", **kwargs) -> Integrator:
+def create_integrator(method: str = "rk4", **kwargs):
     """
-    Factory function to create integrator.
+    Factory to create integrator.
 
-    Args:
-        method: 'euler', 'rk4', 'heun', or 'dopri5'
-
-    Returns:
-        integrator: Integrator instance
+    Note: For Euler/RK4, use liquid_net.solvers directly.
     """
     return Integrator(method)
