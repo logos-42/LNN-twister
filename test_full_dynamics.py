@@ -200,7 +200,7 @@ ax4 = axes[1, 1]
 all_taus = []
 for z in states_tensor:
     tau = model.cell.compute_tau(z)
-    all_taus.extend(tau.flatten().cpu().numpy())
+    all_taus.extend(tau.detach().flatten().cpu().numpy())
 ax4.hist(all_taus, bins=30, edgecolor='black', alpha=0.7)
 ax4.set_xlabel('τ value')
 ax4.set_ylabel('Frequency')
