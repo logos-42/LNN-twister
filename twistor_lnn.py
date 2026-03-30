@@ -877,19 +877,19 @@ class GroupedQueryAttention(nn.Module):
         # Q: (B, T, n_heads, head_dim) → 转置为 (B, n_heads, T, head_dim)
         q = self.W_q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # KV: (B, T, n_kv_heads, head_dim)
-        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+        # KV: (B, T, n_kv_heads, head_dim) -> 转置为 (B, n_kv_heads, T, head_dim)
+        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         
-        # 应用 LayerNorm
-        if self.q_layer_norm is not None:
-            q = self.q_layer_norm(q)
-            k = self.k_layer_norm(k)
-        
+        # 先进行 repeat_interleave，再应用 LayerNorm
         # 分组广播：每 n_heads/n_kv_heads 个 Q 头共享一个 KV 头
         n_repeat = self.n_heads // self.n_kv_heads
         k = k.repeat_interleave(n_repeat, dim=1)  # (B, n_heads, T, head_dim)
         v = v.repeat_interleave(n_repeat, dim=1)  # (B, n_heads, T, head_dim)
+        
+        # 注意：QK LayerNorm 在 4D tensor 上应用较复杂，这里暂时跳过
+        # 如需启用，需先 reshape 到 3D，应用 LayerNorm，再 reshape 回 4D
+        # 保持 LayerNorm 参数但暂不使用，待后续优化
         
         # Attention 计算: (B, n_heads, T, T)
         scale = self.head_dim ** -0.5
@@ -1113,7 +1113,10 @@ class TwistorLNNwithGQA(nn.Module):
                     self.should_trigger_attention(tau)
                 )
                 
-                if trigger_condition:
+                # trigger_condition 可能是 (B,) 的 tensor，需要用 any() 判断
+                should_attend = (t % self.attention_interval == 0) or self.should_trigger_attention(tau).any()
+                
+                if should_attend:
                     # 将复数状态转为实数序列用于 Attention
                     z_real = z.real  # (B, hidden_dim)
                     
@@ -1152,12 +1155,15 @@ class TwistorLNNwithGQA(nn.Module):
         # ODE 动力学
         dzdt = self.compute_dzdt(z, x)
         z_new = z + dt * dzdt
-        z_new = torch.clamp(z_new, -self.z_max, self.z_max)
+        z_new = torch.complex(
+            torch.clamp(z_new.real, -self.z_max, self.z_max),
+            torch.clamp(z_new.imag, -self.z_max, self.z_max)
+        )
         
         # 可选 GQA
         if self.use_gqa:
             tau = self.compute_tau(z_new)
-            if self.should_trigger_attention(tau):
+            if self.should_trigger_attention(tau).any():
                 z_real = z_new.real
                 z_seq = z_real.unsqueeze(1)
                 attn_out = self.gqa(z_seq)

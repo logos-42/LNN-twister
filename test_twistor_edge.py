@@ -7,7 +7,15 @@ import numpy as np
 
 # 尝试导入，如果失败说明有语法问题
 try:
-    from twistor_lnn import TwistorLNNwithGQA, GroupedQueryAttention
+    import importlib.util
+    
+    # 直接从 twistor_lnn.py 文件加载模块
+    spec = importlib.util.spec_from_file_location("twistor_lnn_module", "twistor_lnn.py")
+    twistor_lnn_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(twistor_lnn_module)
+    
+    TwistorLNNwithGQA = twistor_lnn_module.TwistorLNNwithGQA
+    GroupedQueryAttention = twistor_lnn_module.GroupedQueryAttention
     print("✓ 导入成功: TwistorLNNwithGQA, GroupedQueryAttention")
 except Exception as e:
     print(f"✗ 导入失败: {e}")
