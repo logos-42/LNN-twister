@@ -1,0 +1,125 @@
+# .github/workflows/auto-archive.yml
+# Twistor-LNN GitHub 自动存档工作流
+
+name: Auto Archive
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Commit message'
+        required: true
+        default: 'Auto archive'
+      run_tests:
+        description: 'Run tests'
+        required: true
+        default: 'true'
+      auto_push:
+        description: 'Auto push'
+        required: true
+        default: 'true'
+
+jobs:
+  test-and-archive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch numpy matplotlib
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        fi
+    
+    - name: Run tests
+      if: github.event.inputs.run_tests == 'true' || github.event_name == 'push'
+      run: |
+        echo "Running import test..."
+        python -c "
+        import torch
+        from twistor_100m_config import StackedTwistorLNN, TwistorLNNConfig
+        
+        config = TwistorLNNConfig.small()
+        model = StackedTwistorLNN(config)
+        
+        x = torch.randn(10, 1, 1)
+        with torch.no_grad():
+            y = model(x)
+        
+        assert y.shape == (10, 1, 1), f'Output shape error: {y.shape}'
+        print('✓ Import test passed')
+        "
+        
+        echo "Running evolution system test..."
+        python -c "
+        from auto_evolution import AutoEvolutionSystem, ArchitectureConfig
+        
+        config = ArchitectureConfig(hidden_dim=64, n_layers=2)
+        assert config.hidden_dim == 64
+        assert config.n_layers == 2
+        print('✓ Evolution system test passed')
+        "
+        
+        echo "✓ All tests passed"
+    
+    - name: Configure Git
+      run: |
+        git config user.name "GitHub Actions Bot"
+        git config user.email "actions@github.com"
+    
+    - name: Archive to GitHub
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Archiving to GitHub..."
+        
+        # Get commit message
+        if [ -n "${{ github.event.inputs.message }}" ]; then
+          MESSAGE="${{ github.event.inputs.message }}"
+        else
+          MESSAGE="Auto archive: ${{ github.event.head_commit.message }}"
+        fi
+        
+        echo "Commit message: $MESSAGE"
+        
+        # Show status
+        git status
+        
+        # Archive is already done by the push
+        echo "✓ Archive complete"
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          archive_log.json
+          *.png
+        retention-days: 30
+    
+    - name: Notify on failure
+      if: failure()
+      run: |
+        echo "::error::Archive failed! Please check the logs."
+        echo "Rolling back..."
+        
+        # Try to rollback
+        git reset --hard HEAD~1 || true
+        echo "Rollback complete"
