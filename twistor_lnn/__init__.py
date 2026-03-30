@@ -64,6 +64,13 @@ from .training import (
     plot_predictions,
 )
 
+# ========== GQA Attention (Edge 版本) ==========
+from twistor_lnn import (
+    TwistorLNNwithGQA,
+    GroupedQueryAttention,
+    TwistorLNNEdge,
+)
+
 __version__ = "1.3.0"
 
 __all__ = [
