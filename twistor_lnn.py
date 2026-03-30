@@ -20,6 +20,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, Dict, Optional
 
+from twistor_lnn.datasets import generate_sine_dataset
+
 
 class TwistorLNN(nn.Module):
     """
@@ -814,44 +816,410 @@ class TwistorAgent:
         return output
 
 
-def generate_sine_dataset(
-    n_samples: int = 1000,
-    seq_len: int = 50,
-    input_dim: int = 2,
-    noise_std: float = 0.1,
-    device: str = "cpu",
-):
+# ============================================================================
+# Phase 1: GQA Attention + Twistor-LNN 融合 (LFM2 风格)
+# ============================================================================
+
+class GroupedQueryAttention(nn.Module):
     """
-    Generate synthetic sine wave prediction dataset.
+    分组查询注意力 (Grouped Query Attention)
+    
+    类似 LFM2 的 GQA 实现：
+    - n_heads 个查询头
+    - n_kv_heads 个 KV 头 (更少，共享)
+    - 每 n_heads/n_kv_heads 个查询头共享一个 KV 头
+    
+    优势：减少 KV 内存，提高效率
     """
-    X = []
-    y = []
+    
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        n_kv_heads: int = 2,
+        qk_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = dim // n_heads
+        
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+        
+        # Q 投影：每个头独立
+        self.W_q = nn.Linear(dim, dim)
+        # KV 投影：更少的头，共享
+        self.W_k = nn.Linear(dim, n_kv_heads * self.head_dim)
+        self.W_v = nn.Linear(dim, n_kv_heads * self.head_dim)
+        # 输出投影
+        self.W_o = nn.Linear(dim, dim)
+        
+        # QK LayerNorm (类似 LFM2，增加稳定性)
+        if qk_layer_norm:
+            self.q_layer_norm = nn.LayerNorm(self.head_dim)
+            self.k_layer_norm = nn.LayerNorm(self.head_dim)
+        else:
+            self.q_layer_norm = None
+            self.k_layer_norm = None
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x: 输入 (B, T, D)
+            mask: 注意力掩码 (B, n_heads, T, T)
+        
+        Returns:
+            输出 (B, T, D)
+        """
+        B, T, D = x.shape
+        
+        # Q: (B, T, n_heads, head_dim) → 转置为 (B, n_heads, T, head_dim)
+        q = self.W_q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # KV: (B, T, n_kv_heads, head_dim)
+        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+        
+        # 应用 LayerNorm
+        if self.q_layer_norm is not None:
+            q = self.q_layer_norm(q)
+            k = self.k_layer_norm(k)
+        
+        # 分组广播：每 n_heads/n_kv_heads 个 Q 头共享一个 KV 头
+        n_repeat = self.n_heads // self.n_kv_heads
+        k = k.repeat_interleave(n_repeat, dim=1)  # (B, n_heads, T, head_dim)
+        v = v.repeat_interleave(n_repeat, dim=1)  # (B, n_heads, T, head_dim)
+        
+        # Attention 计算: (B, n_heads, T, T)
+        scale = self.head_dim ** -0.5
+        scores = torch.einsum('bhqd,bhkd->bhqk', q, k) * scale
+        
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # (B, n_heads, T, head_dim)
+        
+        # 合并头并输出
+        out = out.transpose(1, 2).reshape(B, T, D)  # (B, T, D)
+        out = self.W_o(out)
+        
+        return out
 
-    for _ in range(n_samples):
-        freq = np.random.uniform(0.5, 2.0)
-        phase = np.random.uniform(0, 2 * np.pi)
-        t = np.linspace(0, 4 * np.pi, seq_len + 1)
-        signal = np.sin(freq * t + phase)
-        signal += np.random.randn(len(t)) * noise_std
 
-        sin_component = signal[:-1]
-        cos_component = (
-            np.cos(freq * t[:-1] + phase) + np.random.randn(seq_len) * noise_std
-        )
+class TwistorLNNwithGQA(nn.Module):
+    """
+    Twistor-LNN + GQA 融合版本 (Twistor-LNN-Edge)
+    
+    核心设计：
+    - 大部分层：ODE 动力学（局部建模，类似 LFM2 的短卷积）
+    - 关键节点：GQA Attention（全局建模，稀疏触发）
+    - τ(z) 阈值决定是否触发 Attention
+    
+    公式：
+        dz/dt = (-z + W·tanh(z) + U·x) / τ(z)  # 局部 ODE
+        + [可选] GQA_Attention(z, z; τ)         # 全局交互（τ < 阈值时）
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 16,
+        output_dim: int = 1,
+        sparsity: float = 0.3,
+        multi_scale_tau: bool = True,
+        dt: float = 0.1,
+        tau_min: float = 0.01,
+        tau_max: float = 1.0,
+        dzdt_max: float = 10.0,
+        z_max: float = 100.0,
+        # GQA 参数
+        use_gqa: bool = True,
+        n_heads: int = 4,
+        n_kv_heads: int = 1,
+        attention_interval: int = 5,
+        tau_attention_threshold: float = 0.3,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.sparsity = sparsity
+        self.multi_scale_tau = multi_scale_tau
+        
+        # 稳定性参数
+        self.dt = dt
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.dzdt_max = dzdt_max
+        self.z_max = z_max
+        
+        # GQA 参数
+        self.use_gqa = use_gqa
+        self.attention_interval = attention_interval
+        self.tau_attention_threshold = tau_attention_threshold
+        
+        # Twistor-LNN 权重
+        self.W_real = nn.Linear(hidden_dim, hidden_dim)
+        self.W_imag = nn.Linear(hidden_dim, hidden_dim)
+        self.U = nn.Linear(input_dim, hidden_dim)
+        self.W_tau = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.sparse_mask_real = nn.Parameter(torch.ones(hidden_dim, hidden_dim))
+        self.sparse_mask_imag = nn.Parameter(torch.ones(hidden_dim, hidden_dim))
+        
+        if multi_scale_tau:
+            self.tau_bias = nn.Parameter(torch.zeros(hidden_dim))
+        else:
+            self.tau_bias = None
+        
+        self.b_real = nn.Parameter(torch.zeros(hidden_dim))
+        self.b_imag = nn.Parameter(torch.zeros(hidden_dim))
+        
+        self.out = nn.Linear(hidden_dim, output_dim)
+        
+        # GQA 模块
+        if use_gqa:
+            self.gqa = GroupedQueryAttention(
+                dim=hidden_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                qk_layer_norm=True,
+            )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        nn.init.orthogonal_(self.W_real.weight, gain=0.5)
+        nn.init.orthogonal_(self.W_imag.weight, gain=0.5)
+        nn.init.orthogonal_(self.U.weight, gain=0.5)
+        nn.init.orthogonal_(self.W_tau.weight, gain=0.1)
+        nn.init.zeros_(self.W_real.bias)
+        nn.init.zeros_(self.W_imag.bias)
+        nn.init.zeros_(self.U.bias)
+        nn.init.zeros_(self.W_tau.bias)
+        nn.init.zeros_(self.b_real)
+        nn.init.zeros_(self.b_imag)
+        
+        # 稀疏掩码
+        if self.sparsity > 0:
+            with torch.no_grad():
+                mask_real = (torch.rand(self.hidden_dim, self.hidden_dim) > self.sparsity).float()
+                mask_imag = (torch.rand(self.hidden_dim, self.hidden_dim) > self.sparsity).float()
+                self.sparse_mask_real.copy_(mask_real)
+                self.sparse_mask_imag.copy_(mask_imag)
+        
+        if self.multi_scale_tau and self.tau_bias is not None:
+            nn.init.zeros_(self.tau_bias)
+    
+    def compute_tau(self, z: torch.Tensor) -> torch.Tensor:
+        """计算时间常数"""
+        z_mod = torch.abs(z)
+        tau = F.sigmoid(self.W_tau(z_mod))
+        
+        if self.multi_scale_tau and self.tau_bias is not None:
+            tau = tau + self.tau_bias.unsqueeze(0)
+        
+        tau = torch.clamp(tau, self.tau_min, self.tau_max)
+        return tau + 1e-6
+    
+    def should_trigger_attention(self, tau: torch.Tensor) -> torch.Tensor:
+        """
+        基于 τ 决定是否触发 Attention
+        当 τ 较小时（状态变化快），需要更多全局信息
+        
+        Returns:
+            trigger: (B,) bool tensor
+        """
+        tau_mean = tau.mean(dim=-1)  # (B,)
+        return tau_mean < self.tau_attention_threshold
+    
+    def compute_dzdt(self, z: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """计算 ODE 动力学项"""
+        z_real = z.real
+        z_imag = z.imag
+        
+        tanh_real = torch.tanh(z_real)
+        tanh_imag = torch.tanh(z_imag)
+        
+        if self.sparsity > 0:
+            W_real_sparse = self.W_real.weight * torch.sigmoid(self.sparse_mask_real)
+            W_imag_sparse = self.W_imag.weight * torch.sigmoid(self.sparse_mask_imag)
+            W_tanh_real = F.linear(tanh_real, W_real_sparse, self.W_real.bias)
+            W_tanh_imag = F.linear(tanh_imag, W_imag_sparse, self.W_imag.bias)
+        else:
+            W_tanh_real = self.W_real(tanh_real)
+            W_tanh_imag = self.W_imag(tanh_imag)
+        
+        Ux = self.U(x)
+        
+        dz_real = -z_real + W_tanh_real + Ux + self.b_real
+        dz_imag = -z_imag + W_tanh_imag + Ux + self.b_imag
+        
+        tau = self.compute_tau(z)
+        
+        dzdt = torch.complex(dz_real / tau, dz_imag / tau)
+        
+        # 限幅
+        dzdt_real = torch.clamp(dzdt.real, -self.dzdt_max, self.dzdt_max)
+        dzdt_imag = torch.clamp(dzdt.imag, -self.dzdt_max, self.dzdt_max)
+        dzdt = torch.complex(dzdt_real, dzdt_imag)
+        
+        return dzdt
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_states: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        前向传播：ODE 动力学 + 稀疏 GQA Attention
+        
+        Args:
+            x: 输入序列 (T, B, input_dim)
+            
+        Returns:
+            y: 输出序列 (T, B, output_dim)
+        """
+        T, B, _ = x.shape
+        
+        # 初始化复数状态
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        outputs = []
+        states = []
+        attention_count = 0
+        
+        for t in range(T):
+            x_t = x[t]
+            
+            # ===== 1. ODE 动力学（局部建模）=====
+            dzdt = self.compute_dzdt(z, x_t)
+            z = z + self.dt * dzdt
+            z = torch.complex(
+                torch.clamp(z.real, -self.z_max, self.z_max),
+                torch.clamp(z.imag, -self.z_max, self.z_max)
+            )
+            
+            # ===== 2. 可选：GQA Attention（全局建模）=====
+            if self.use_gqa:
+                tau = self.compute_tau(z)
+                
+                # 触发条件：τ < 阈值 或 每隔固定步数
+                trigger_condition = (
+                    (t % self.attention_interval == 0) or 
+                    self.should_trigger_attention(tau)
+                )
+                
+                if trigger_condition:
+                    # 将复数状态转为实数序列用于 Attention
+                    z_real = z.real  # (B, hidden_dim)
+                    
+                    # 简化：用当前状态做 self-attention
+                    # 在实际应用中可以用过去所有状态
+                    z_seq = z_real.unsqueeze(1)  # (B, 1, D)
+                    attn_out = self.gqa(z_seq)  # (B, 1, D)
+                    
+                    # 将 Attention 结果加回状态
+                    z = torch.complex(
+                        z.real + attn_out.squeeze(1) * 0.1,  # 残差连接
+                        z.imag
+                    )
+                    attention_count += 1
+            
+            # 输出
+            y_t = self.out(z.real)
+            outputs.append(y_t)
+            
+            if return_states:
+                states.append(z)
+        
+        y = torch.stack(outputs, dim=0)
+        
+        if return_states:
+            states = torch.stack(states, dim=0)
+            return y, states
+        
+        return y
+    
+    def step(self, z: torch.Tensor, x: torch.Tensor, dt: float = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """单步演化（用于 Agent）"""
+        if dt is None:
+            dt = self.dt
+        
+        # ODE 动力学
+        dzdt = self.compute_dzdt(z, x)
+        z_new = z + dt * dzdt
+        z_new = torch.clamp(z_new, -self.z_max, self.z_max)
+        
+        # 可选 GQA
+        if self.use_gqa:
+            tau = self.compute_tau(z_new)
+            if self.should_trigger_attention(tau):
+                z_real = z_new.real
+                z_seq = z_real.unsqueeze(1)
+                attn_out = self.gqa(z_seq)
+                z_new = torch.complex(
+                    z_new.real + attn_out.squeeze(1) * 0.1,
+                    z_new.imag
+                )
+        
+        output = self.out(z_new.real)
+        return z_new, output
+    
+    def reset_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
+        """重置状态"""
+        return torch.zeros(batch_size, self.hidden_dim, dtype=torch.complex64, device=device)
 
-        x_seq = np.stack([sin_component, cos_component], axis=-1)
-        y_seq = signal[1:].reshape(-1, 1)
 
-        X.append(x_seq)
-        y.append(y_seq)
-
-    X = torch.FloatTensor(np.stack(X)).to(device)
-    y = torch.FloatTensor(np.stack(y)).to(device)
-
-    return X, y
+# 保留原有类名作为别名，方便迁移
+TwistorLNNEdge = TwistorLNNwithGQA
 
 
-def plot_training_results(history: Dict[str, list]):
+if __name__ == "__main__":
+    # 简单测试
+    print("=" * 60)
+    print("Twistor-LNN-Edge (GQA 融合版本) 测试")
+    print("=" * 60)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 创建模型
+    model = TwistorLNNwithGQA(
+        input_dim=2,
+        hidden_dim=32,
+        output_dim=1,
+        use_gqa=True,
+        n_heads=4,
+        n_kv_heads=1,
+        attention_interval=3,
+        tau_attention_threshold=0.3,
+    ).to(device)
+    
+    print(f"模型参数: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 生成测试数据
+    X = torch.randn(20, 4, 2).to(device)  # (T, B, input_dim)
+    
+    # 前向传播
+    model.eval()
+    with torch.no_grad():
+        y = model(X)
+        print(f"输入形状: {X.shape}")
+        print(f"输出形状: {y.shape}")
+    
+    # 测试单步
+    z = model.reset_state(1, device)
+    x = torch.randn(1, 2).to(device)
+    z, output = model.step(z, x)
+    print(f"单步输出: {output.shape}")
+    
+    print("\n测试完成！")
+
+
+
     """Plot training curves."""
     plt.figure(figsize=(12, 4))
 
