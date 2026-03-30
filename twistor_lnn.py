@@ -1283,3 +1283,857 @@ if __name__ == "__main__":
         f"  Convergence: {'Yes' if history['train_loss'][-1] < history['train_loss'][0] * 0.5 else 'Partial'}"
     )
     print("=" * 60)
+
+
+# ============================================================================
+# v2.0: 多任务和零样本学习扩展
+# ============================================================================
+
+from dataclasses import dataclass
+from typing import List, Optional as TypingOptional
+
+
+@dataclass
+class TaskConfig:
+    """任务配置"""
+    task_id: int
+    task_name: str
+    input_dim: int
+    output_dim: int
+
+
+class MultiTaskTwistorLNN(nn.Module):
+    """
+    支持多任务学习的 Twistor-LNN v2.0
+    
+    核心思想:
+    1. 共享的动力学核心 (Shared Dynamics Core)
+    2. 任务特定的嵌入 (Task-specific Embeddings)
+    3. 任务特定的输入/输出投影 (Task-specific Projections)
+    """
+    
+    def __init__(
+        self,
+        task_configs: List[TaskConfig],
+        hidden_dim: int = 32,
+        task_embedding_dim: int = 8,
+        dt: float = 0.1,
+        tau_min: float = 0.01,
+        tau_max: float = 1.0,
+    ):
+        super().__init__()
+        self.task_configs = task_configs
+        self.hidden_dim = hidden_dim
+        self.task_embedding_dim = task_embedding_dim
+        self.dt = dt
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.n_tasks = len(task_configs)
+        
+        # 1. 任务嵌入 (共享)
+        self.task_embeddings = nn.ParameterDict({
+            cfg.task_name: nn.Parameter(torch.randn(task_embedding_dim))
+            for cfg in task_configs
+        })
+        
+        # 2. 共享动力学核心
+        self.dynamics_core = nn.ModuleDict({
+            'W_z': nn.Linear(hidden_dim, hidden_dim),
+            'W_x': nn.Linear(hidden_dim + task_embedding_dim, hidden_dim),
+            'W_tau': nn.Linear(hidden_dim, hidden_dim),
+        })
+        self.tau_bias = nn.Parameter(torch.zeros(hidden_dim))
+        
+        # 3. 任务特定的输入投影
+        self.input_projections = nn.ModuleDict({
+            cfg.task_name: nn.Linear(cfg.input_dim, hidden_dim)
+            for cfg in task_configs
+        })
+        
+        # 4. 任务特定的输出投影
+        self.output_projections = nn.ModuleDict({
+            cfg.task_name: nn.Linear(hidden_dim, cfg.output_dim)
+            for cfg in task_configs
+        })
+        
+        # 5. 任务门控网络
+        self.task_gates = nn.ModuleDict({
+            cfg.task_name: nn.Sequential(
+                nn.Linear(task_embedding_dim, hidden_dim),
+                nn.Sigmoid()
+            )
+            for cfg in task_configs
+        })
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        for name, param in self.dynamics_core.items():
+            if isinstance(param, nn.Linear):
+                nn.init.orthogonal_(param.weight, gain=0.5)
+                nn.init.zeros_(param.bias)
+        
+        for proj in self.input_projections.values():
+            nn.init.orthogonal_(proj.weight, gain=0.5)
+            nn.init.zeros_(proj.bias)
+        
+        for proj in self.output_projections.values():
+            nn.init.orthogonal_(proj.weight, gain=0.5)
+            nn.init.zeros_(proj.bias)
+    
+    def compute_dzdt(
+        self, 
+        z: torch.Tensor, 
+        x: torch.Tensor, 
+        task_emb: torch.Tensor,
+        task_name: str
+    ) -> torch.Tensor:
+        """计算动力学方程 (任务条件化)"""
+        z_real = z.real
+        z_imag = z.imag
+        
+        # 任务门控
+        gate = self.task_gates[task_name](task_emb)
+        
+        # 非线性项
+        tanh_real = torch.tanh(z_real)
+        tanh_imag = torch.tanh(z_imag)
+        
+        W_tanh_real = self.dynamics_core['W_z'](tanh_real)
+        W_tanh_imag = self.dynamics_core['W_z'](tanh_imag)
+        
+        # 输入项 (拼接任务嵌入)
+        x_task = torch.cat([x, task_emb.unsqueeze(0).expand(x.size(0), -1)], dim=-1)
+        Ux = self.dynamics_core['W_x'](x_task)
+        
+        # 应用门控
+        W_tanh_real = gate * W_tanh_real
+        W_tanh_imag = gate * W_tanh_imag
+        Ux = gate * Ux
+        
+        # 动力学方程
+        dz_real = -z_real + W_tanh_real + Ux
+        dz_imag = -z_imag + W_tanh_imag + Ux
+        
+        # 时间常数
+        z_mod = torch.abs(z)
+        tau = torch.sigmoid(self.dynamics_core['W_tau'](z_mod))
+        tau = tau + self.tau_bias.unsqueeze(0)
+        tau = torch.clamp(tau, self.tau_min, self.tau_max) + 1e-6
+        
+        dzdt = torch.complex(dz_real / tau, dz_imag / tau)
+        dzdt = torch.clamp(dzdt.real, -10, 10) + 1j * torch.clamp(dzdt.imag, -10, 10)
+        
+        return dzdt
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        task_name: str,
+        return_states: bool = False
+    ) -> torch.Tensor:
+        """前向传播 (指定任务)"""
+        T, B, _ = x.shape
+        
+        # 获取任务嵌入
+        task_emb = self.task_embeddings[task_name]
+        
+        # 初始化状态
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        # 获取任务特定的投影
+        input_proj = self.input_projections[task_name]
+        output_proj = self.output_projections[task_name]
+        
+        outputs = []
+        states = []
+        
+        for t in range(T):
+            x_t = x[t]
+            
+            # 输入投影
+            x_encoded = input_proj(x_t)
+            
+            # 动力学演化
+            dzdt = self.compute_dzdt(z, x_encoded, task_emb, task_name)
+            z = z + self.dt * dzdt
+            
+            # 状态限幅
+            z = torch.complex(
+                torch.clamp(z.real, -100, 100),
+                torch.clamp(z.imag, -100, 100)
+            )
+            
+            # 输出投影
+            y_t = output_proj(z.real)
+            outputs.append(y_t)
+            
+            if return_states:
+                states.append(z)
+        
+        y = torch.stack(outputs, dim=0)
+        
+        if return_states:
+            states = torch.stack(states, dim=0)
+            return y, states
+        
+        return y
+    
+    def zero_shot_transfer(
+        self, 
+        x: torch.Tensor, 
+        source_task: str, 
+        target_task: str
+    ) -> torch.Tensor:
+        """零样本迁移：使用源任务的输入投影 + 目标任务的输出投影"""
+        T, B, _ = x.shape
+        task_emb = self.task_embeddings[target_task]
+        
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        # 使用源任务的输入投影
+        input_proj = self.input_projections[source_task]
+        # 使用目标任务的输出投影
+        output_proj = self.output_projections[target_task]
+        
+        outputs = []
+        
+        for t in range(T):
+            x_t = x[t]
+            x_encoded = input_proj(x_t)
+            
+            dzdt = self.compute_dzdt(z, x_encoded, task_emb, target_task)
+            z = z + self.dt * dzdt
+            
+            y_t = output_proj(z.real)
+            outputs.append(y_t)
+        
+        return torch.stack(outputs, dim=0)
+
+
+class MetaTwistorLNN(nn.Module):
+    """
+    基于元学习的 Twistor-LNN v2.0，支持零样本适应新任务
+    
+    使用 MAML (Model-Agnostic Meta-Learning) 算法
+    """
+    
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 32,
+        output_dim: int = 1,
+        dt: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dt = dt
+        
+        # 共享参数 (元学习初始化)
+        self.meta_params = nn.ParameterDict({
+            'W_z': nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.1),
+            'W_x': nn.Parameter(torch.randn(hidden_dim, input_dim) * 0.1),
+            'W_out': nn.Parameter(torch.randn(output_dim, hidden_dim) * 0.1),
+            'W_tau': nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.01),
+            'b_z': nn.Parameter(torch.zeros(hidden_dim)),
+            'b_x': nn.Parameter(torch.zeros(hidden_dim)),
+            'b_out': nn.Parameter(torch.zeros(output_dim)),
+        })
+    
+    def compute_dzdt_fast(
+        self, 
+        z: torch.Tensor, 
+        x: torch.Tensor,
+        params: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """快速动力学计算 (使用给定参数)"""
+        z_real = z.real
+        z_imag = z.imag
+        
+        tanh_real = torch.tanh(z_real)
+        tanh_imag = torch.tanh(z_imag)
+        
+        W_tanh_real = F.linear(tanh_real, params['W_z'], params['b_z'])
+        W_tanh_imag = F.linear(tanh_imag, params['W_z'], params['b_z'])
+        Ux = F.linear(x, params['W_x'], params['b_x'])
+        
+        dz_real = -z_real + W_tanh_real + Ux
+        dz_imag = -z_imag + W_tanh_imag
+        
+        z_mod = torch.abs(z)
+        tau = torch.sigmoid(F.linear(z_mod, params['W_tau'])) + 1e-6
+        
+        dzdt = torch.complex(dz_real / tau, dz_imag / tau)
+        dzdt = torch.clamp(dzdt.real, -10, 10) + 1j * torch.clamp(dzdt.imag, -10, 10)
+        
+        return dzdt
+    
+    def forward_step(
+        self, 
+        z: torch.Tensor, 
+        x: torch.Tensor, 
+        params: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """单步前向传播"""
+        dzdt = self.compute_dzdt_fast(z, x, params)
+        z_new = z + self.dt * dzdt
+        y = F.linear(z_new.real, params['W_out'], params['b_out'])
+        return z_new, y
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        params: TypingOptional[Dict] = None
+    ) -> torch.Tensor:
+        """前向传播"""
+        if params is None:
+            params = self.meta_params
+        
+        T, B, _ = x.shape
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        outputs = []
+        for t in range(T):
+            z, y_t = self.forward_step(z, x[t], params)
+            outputs.append(y_t)
+        
+        return torch.stack(outputs, dim=0)
+    
+    def meta_update(
+        self, 
+        x_support: torch.Tensor, 
+        y_support: torch.Tensor,
+        x_query: torch.Tensor,
+        y_query: torch.Tensor,
+        inner_lr: float = 0.1,
+        inner_steps: int = 5
+    ) -> Tuple[torch.Tensor, Dict]:
+        """MAML 元更新"""
+        # 1. 复制参数进行适应
+        adapted_params = {k: v.clone() for k, v in self.meta_params.items()}
+        
+        # 2. 在支持集上进行梯度下降适应
+        for _ in range(inner_steps):
+            y_pred = self.forward(x_support, adapted_params)
+            support_loss = F.mse_loss(y_pred, y_support)
+            
+            # 计算梯度并更新
+            grads = torch.autograd.grad(
+                support_loss, 
+                adapted_params.values(),
+                create_graph=True
+            )
+            
+            for (name, param), grad in zip(adapted_params.items(), grads):
+                adapted_params[name] = param - inner_lr * grad
+        
+        # 3. 在查询集上评估
+        y_query_pred = self.forward(x_query, adapted_params)
+        query_loss = F.mse_loss(y_query_pred, y_query)
+        
+        return query_loss, adapted_params
+    
+    def zero_shot_adapt(
+        self, 
+        x_few_shot: torch.Tensor, 
+        y_few_shot: torch.Tensor,
+        x_test: torch.Tensor,
+        adapt_steps: int = 10,
+        adapt_lr: float = 0.1
+    ) -> torch.Tensor:
+        """零样本适应：使用少量样本快速适应新任务"""
+        # 复制参数 (需要梯度)
+        adapted_params = {}
+        for name, param in self.meta_params.items():
+            adapted_params[name] = param.clone().detach().requires_grad_(True)
+        
+        # 快速适应
+        for _ in range(adapt_steps):
+            y_pred = self.forward(x_few_shot, adapted_params)
+            loss = F.mse_loss(y_pred, y_few_shot)
+            
+            grads = torch.autograd.grad(
+                loss, 
+                adapted_params.values(),
+                retain_graph=True,
+                create_graph=False
+            )
+            
+            for (name, param), grad in zip(adapted_params.items(), grads):
+                adapted_params[name] = param - adapt_lr * grad
+        
+        # 使用适应后的参数进行预测
+        y_test_pred = self.forward(x_test, adapted_params)
+        
+        return y_test_pred
+
+
+class PromptTwistorLNN(nn.Module):
+    """
+    基于提示学习的 Twistor-LNN v2.0
+    
+    核心思想：
+    1. 学习一组"提示"向量 (Prompt Vectors)
+    2. 不同任务使用不同的提示组合
+    3. 新任务通过提示组合实现零样本迁移
+    """
+    
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 32,
+        output_dim: int = 1,
+        n_prompts: int = 10,
+        prompt_dim: int = 8,
+        dt: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dt = dt
+        self.n_prompts = n_prompts
+        
+        # 提示库
+        self.prompt_bank = nn.Parameter(torch.randn(n_prompts, prompt_dim))
+        
+        # 提示选择网络
+        self.prompt_selector = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, n_prompts),
+            nn.Softmax(dim=-1)
+        )
+        
+        # 提示投影
+        self.prompt_proj = nn.Linear(prompt_dim, hidden_dim)
+        
+        # 核心动力学
+        self.core = nn.ModuleDict({
+            'W_z': nn.Linear(hidden_dim, hidden_dim),
+            'W_x': nn.Linear(input_dim, hidden_dim),
+            'W_tau': nn.Linear(hidden_dim, hidden_dim),
+        })
+        
+        # 输出层
+        self.out = nn.Linear(hidden_dim, output_dim)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.orthogonal_(self.core['W_z'].weight, gain=0.5)
+        nn.init.orthogonal_(self.core['W_x'].weight, gain=0.5)
+        nn.init.orthogonal_(self.core['W_tau'].weight, gain=0.1)
+        nn.init.zeros_(self.core['W_z'].bias)
+        nn.init.zeros_(self.core['W_x'].bias)
+        nn.init.zeros_(self.core['W_tau'].bias)
+    
+    def get_prompt(self, x: torch.Tensor) -> torch.Tensor:
+        """获取输入相关的提示"""
+        weights = self.prompt_selector(x)
+        prompt = torch.einsum('bn,np->bp', weights, self.prompt_bank)
+        return self.prompt_proj(prompt)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播"""
+        T, B, _ = x.shape
+        z = torch.zeros(B, self.hidden_dim, dtype=torch.complex64, device=x.device)
+        
+        outputs = []
+        
+        for t in range(T):
+            x_t = x[t]
+            
+            # 获取提示
+            prompt = self.get_prompt(x_t)
+            
+            # 动力学
+            z_real = z.real
+            z_imag = z.imag
+            
+            tanh_real = torch.tanh(z_real)
+            tanh_imag = torch.tanh(z_imag)
+            
+            W_tanh_real = self.core['W_z'](tanh_real)
+            W_tanh_imag = self.core['W_z'](tanh_imag)
+            Ux = self.core['W_x'](x_t)
+            
+            # 添加提示影响
+            W_tanh_real = W_tanh_real + prompt
+            W_tanh_imag = W_tanh_imag + prompt
+            
+            dz_real = -z_real + W_tanh_real + Ux
+            dz_imag = -z_imag + W_tanh_imag
+            
+            z_mod = torch.abs(z)
+            tau = torch.sigmoid(self.core['W_tau'](z_mod)) + 1e-6
+            
+            dzdt = torch.complex(dz_real / tau, dz_imag / tau)
+            dzdt = torch.clamp(dzdt.real, -10, 10) + 1j * torch.clamp(dzdt.imag, -10, 10)
+
+            z = z + self.dt * dzdt
+
+            y_t = self.out(z.real)
+            outputs.append(y_t)
+
+        return torch.stack(outputs, dim=0)
+
+
+# ============================================================================
+# 0.2.1: 自生产数据和自训练循环扩展
+# ============================================================================
+
+class SelfTrainingTwistorLNN(nn.Module):
+    """
+    支持自生产数据和自训练循环的 Twistor-LNN 0.2.1
+    
+    核心能力:
+    1. 自动生成训练数据
+    2. 自动训练循环
+    3. 性能评估
+    4. 数据生成策略调整
+    5. 持续迭代改进
+    """
+    
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 32,
+        output_dim: int = 1,
+        dt: float = 0.1,
+        **kwargs
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dt = dt
+        
+        # 核心模型
+        self.model = TwistorLNN(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            dt=dt,
+            **kwargs
+        )
+        
+        # 数据生成参数
+        self.data_params = {
+            'freq_range': (0.5, 2.0),
+            'noise_std': 0.1,
+            'seq_len': 50,
+            'n_samples': 100,
+        }
+        
+        # 训练历史
+        self.training_history = {
+            'epoch': [],
+            'train_loss': [],
+            'val_loss': [],
+            'data_quality': [],
+        }
+        
+        # 性能指标
+        self.performance_metrics = {
+            'target_loss': 0.01,
+            'min_samples': 50,
+            'max_samples': 500,
+            'patience': 10,
+        }
+    
+    def generate_data(
+        self,
+        task_type: str = 'sine',
+        n_samples: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """自动生成训练数据"""
+        n_samples = n_samples or self.data_params['n_samples']
+        seq_len = seq_len or self.data_params['seq_len']
+        
+        if task_type == 'sine':
+            return self._generate_sine_data(n_samples, seq_len, **kwargs)
+        elif task_type == 'lorenz':
+            return self._generate_lorenz_data(n_samples, seq_len, **kwargs)
+        elif task_type == 'custom':
+            return self._generate_custom_data(n_samples, seq_len, **kwargs)
+        else:
+            raise ValueError(f"Unknown task type: {task_type}")
+    
+    def _generate_sine_data(
+        self, n_samples: int, seq_len: int,
+        freq_range: Optional[Tuple] = None,
+        noise_std: Optional[float] = None,
+        device: str = 'cpu'
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """生成正弦波数据"""
+        freq_range = freq_range or self.data_params['freq_range']
+        noise_std = noise_std or self.data_params['noise_std']
+        
+        X, y = [], []
+        for _ in range(n_samples):
+            freq = np.random.uniform(*freq_range)
+            phase = np.random.uniform(0, 2 * np.pi)
+            t = np.linspace(0, 4 * np.pi, seq_len + 1)
+            
+            signal = np.sin(freq * t + phase) + np.random.randn(len(t)) * noise_std
+            
+            x_seq = np.stack([
+                signal[:-1],
+                np.cos(freq * t[:-1] + phase) + np.random.randn(seq_len) * noise_std
+            ], axis=-1)
+            y_seq = signal[1:].reshape(-1, 1)
+            
+            X.append(x_seq)
+            y.append(y_seq)
+        
+        X = torch.FloatTensor(np.stack(X)).to(device)
+        y = torch.FloatTensor(np.stack(y)).to(device)
+        return X, y
+    
+    def _generate_lorenz_data(
+        self, n_samples: int, seq_len: int,
+        sigma: float = 10.0, rho: float = 28.0, beta: float = 8.0/3.0,
+        dt: float = 0.01, device: str = 'cpu'
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """生成 Lorenz 吸引子数据"""
+        X, y = [], []
+        for _ in range(n_samples):
+            x0 = np.random.uniform(-10, 10, 3)
+            trajectory = [x0]
+            for _ in range(seq_len):
+                x, y_, z = trajectory[-1]
+                dx = sigma * (y_ - x) * dt
+                dy = (x * (rho - z) - y_) * dt
+                dz = (x * y_ - beta * z) * dt
+                trajectory.append([x + dx, y_ + dy, z + dz])
+            
+            trajectory = np.array(trajectory) + np.random.randn(seq_len + 1, 3) * 0.01
+            X.append(trajectory[:-1])
+            y.append(trajectory[1:])
+        
+        X = torch.FloatTensor(np.stack(X)).to(device)
+        y = torch.FloatTensor(np.stack(y)).to(device)
+        return X, y
+    
+    def _generate_custom_data(
+        self, n_samples: int, seq_len: int,
+        func: Optional[callable] = None, device: str = 'cpu'
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """生成自定义数据"""
+        if func is None:
+            def func(t, params):
+                a, b, c = params
+                return a * t + b * np.sin(c * t)
+        
+        X, y = [], []
+        for _ in range(n_samples):
+            params = np.random.uniform(-1, 1, 3)
+            t = np.linspace(0, 10, seq_len + 1)
+            signal = func(t, params) + np.random.randn(len(t)) * 0.05
+            X.append(signal[:-1].reshape(-1, 1))
+            y.append(signal[1:].reshape(-1, 1))
+        
+        X = torch.FloatTensor(np.stack(X)).to(device)
+        y = torch.FloatTensor(np.stack(y)).to(device)
+        return X, y
+    
+    def evaluate_performance(self, X_val: torch.Tensor, y_val: torch.Tensor) -> Dict[str, float]:
+        """评估模型性能"""
+        self.model.eval()
+        with torch.no_grad():
+            x_val = X_val.transpose(0, 1)
+            y_val_t = y_val.transpose(0, 1)
+            y_pred = self.model(x_val)
+            
+            mse = F.mse_loss(y_pred, y_val_t).item()
+            mae = F.l1_loss(y_pred, y_val_t).item()
+            signal_power = torch.var(y_val_t)
+            noise_power = torch.var(y_val_t - y_pred)
+            snr = 10 * torch.log10(signal_power / (noise_power + 1e-8)).item()
+        
+        return {'mse': mse, 'mae': mae, 'snr': snr, 'loss': mse}
+    
+    def adjust_data_strategy(self, current_metrics: Dict[str, float]) -> Dict:
+        """根据性能调整数据生成策略"""
+        current_loss = current_metrics.get('loss', 1.0)
+        target_loss = self.performance_metrics['target_loss']
+        
+        if current_loss > target_loss * 10:
+            self.data_params['n_samples'] = min(
+                self.data_params['n_samples'] * 2, self.performance_metrics['max_samples']
+            )
+            self.data_params['noise_std'] = max(self.data_params['noise_std'] * 0.8, 0.01)
+        elif current_loss > target_loss:
+            self.data_params['n_samples'] = min(
+                int(self.data_params['n_samples'] * 1.2), self.performance_metrics['max_samples']
+            )
+        else:
+            self.data_params['n_samples'] = max(
+                int(self.data_params['n_samples'] * 0.9), self.performance_metrics['min_samples']
+            )
+        
+        return self.data_params
+    
+    def self_training_loop(
+        self, n_iterations: int = 10, epochs_per_iteration: int = 50,
+        task_type: str = 'sine', val_split: float = 0.2,
+        device: str = 'cpu', verbose: bool = True,
+    ) -> Dict:
+        """自训练循环：生成数据 → 训练 → 评估 → 调整策略"""
+        if verbose:
+            print("=" * 60)
+            print("自训练循环开始")
+            print("=" * 60)
+        
+        for iteration in range(n_iterations):
+            if verbose:
+                print(f"\n迭代 {iteration + 1}/{n_iterations}")
+                print("-" * 40)
+            
+            # 1. 生成数据
+            X, y = self.generate_data(task_type=task_type)
+            
+            # 2. 划分训练/验证集
+            n_val = int(len(X) * val_split)
+            indices = torch.randperm(len(X))
+            train_idx, val_idx = indices[n_val:], indices[:n_val]
+            X_train, y_train = X[train_idx], y[train_idx]
+            X_val, y_val = X[val_idx], y[val_idx]
+            
+            if verbose:
+                print(f"   生成数据：{len(X_train)} 训练，{len(X_val)} 验证")
+                print(f"   数据参数：n_samples={self.data_params['n_samples']}, "
+                      f"noise_std={self.data_params['noise_std']}")
+            
+            # 3. 训练
+            self.model.train()
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-2)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+            
+            train_losses = []
+            for epoch in range(epochs_per_iteration):
+                optimizer.zero_grad()
+                perm = torch.randperm(len(X_train), device=device)
+                X_batch = X_train[perm].transpose(0, 1)
+                y_batch = y_train[perm].transpose(0, 1)
+                
+                y_pred = self.model(X_batch)
+                loss = F.mse_loss(y_pred, y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_losses.append(loss.item())
+                scheduler.step(loss)
+            
+            avg_train_loss = np.mean(train_losses)
+            
+            # 4. 评估
+            metrics = self.evaluate_performance(X_val, y_val)
+            
+            if verbose:
+                print(f"   训练损失：{avg_train_loss:.6f}")
+                print(f"   验证 MSE: {metrics['mse']:.6f}")
+                print(f"   验证 SNR: {metrics['snr']:.2f} dB")
+            
+            # 5. 记录历史
+            self.training_history['epoch'].append(iteration)
+            self.training_history['train_loss'].append(avg_train_loss)
+            self.training_history['val_loss'].append(metrics['mse'])
+            self.training_history['data_quality'].append(metrics['snr'])
+            
+            # 6. 调整策略
+            old_params = self.data_params.copy()
+            self.adjust_data_strategy(metrics)
+            
+            if verbose and old_params != self.data_params:
+                print(f"   策略调整：n_samples {old_params['n_samples']} → {self.data_params['n_samples']}")
+            
+            # 7. 检查收敛
+            if metrics['mse'] < self.performance_metrics['target_loss']:
+                if verbose:
+                    print(f"   ✅ 达到目标损失！提前终止")
+                break
+        
+        if verbose:
+            print("\n" + "=" * 60)
+            print("自训练循环完成")
+            print("=" * 60)
+        
+        return {
+            'history': self.training_history,
+            'final_metrics': self.evaluate_performance(X_val, y_val),
+            'data_params': self.data_params,
+        }
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播"""
+        return self.model(x)
+
+
+class AutoCurriculumTrainer:
+    """自动课程学习训练器"""
+    
+    def __init__(self, model: SelfTrainingTwistorLNN):
+        self.model = model
+        self.curriculum_stage = 0
+    
+    def define_curriculum(self, stages: Optional[List[Dict]] = None):
+        """定义课程阶段"""
+        if stages is None:
+            self.curriculum_stages = [
+                {'name': '简单正弦波', 'task_type': 'sine', 'freq_range': (0.5, 1.0), 'noise_std': 0.05, 'seq_len': 30, 'target_loss': 0.1},
+                {'name': '中等正弦波', 'task_type': 'sine', 'freq_range': (0.5, 2.0), 'noise_std': 0.1, 'seq_len': 50, 'target_loss': 0.05},
+                {'name': '复杂正弦波', 'task_type': 'sine', 'freq_range': (1.0, 3.0), 'noise_std': 0.15, 'seq_len': 70, 'target_loss': 0.02},
+                {'name': 'Lorenz 吸引子', 'task_type': 'lorenz', 'seq_len': 50, 'target_loss': 0.05},
+            ]
+        else:
+            self.curriculum_stages = stages
+        self.n_stages = len(self.curriculum_stages)
+    
+    def train_with_curriculum(self, epochs_per_stage: int = 100, device: str = 'cpu', verbose: bool = True) -> Dict:
+        """使用课程学习进行训练"""
+        if verbose:
+            print("=" * 60)
+            print("课程学习训练开始")
+            print(f"课程阶段数：{self.n_stages}")
+            print("=" * 60)
+        
+        self.curriculum_history = {'stage': [], 'stage_name': [], 'loss': [], 'completed': []}
+        
+        for stage_idx, stage in enumerate(self.curriculum_stages):
+            if verbose:
+                print(f"\n阶段 {stage_idx + 1}/{self.n_stages}: {stage['name']}")
+            
+            self.model.data_params.update({k: v for k, v in stage.items() if k in ['freq_range', 'noise_std', 'seq_len', 'n_samples']})
+            
+            result = self.model.self_training_loop(
+                n_iterations=3, epochs_per_iteration=epochs_per_stage // 3,
+                task_type=stage['task_type'], device=device, verbose=verbose,
+            )
+            
+            final_loss = result['final_metrics']['mse']
+            target_loss = stage.get('target_loss', 0.01)
+            completed = final_loss < target_loss
+            
+            self.curriculum_history['stage'].append(stage_idx)
+            self.curriculum_history['stage_name'].append(stage['name'])
+            self.curriculum_history['loss'].append(final_loss)
+            self.curriculum_history['completed'].append(completed)
+            
+            if verbose:
+                print(f"   完成：{'✅ 是' if completed else '❌ 否'}")
+                print(f"   最终损失：{final_loss:.6f} (目标：{target_loss})")
+        
+        if verbose:
+            print("\n" + "=" * 60)
+            print("课程学习训练完成")
+            n_completed = sum(self.curriculum_history['completed'])
+            print(f"完成阶段：{n_completed}/{self.n_stages}")
+        
+        return self.curriculum_history
