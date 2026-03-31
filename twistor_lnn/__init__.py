@@ -63,6 +63,17 @@ from .training import (
     plot_training_results,
     plot_predictions,
 )
+from .mobius import (
+    MobiusConstraint,
+    AdaptiveMobiusConstraint,
+    create_mobius_constraint,
+)
+from .resonance import (
+    TwistorResonance,
+    MultiHeadResonance,
+    create_resonance,
+)
+from .growable import GrowableTwistorLNN, create_growable_twistor_lnn
 
 __version__ = "1.3.0"
 
@@ -119,4 +130,15 @@ __all__ = [
     "train_on_task",
     "plot_training_results",
     "plot_predictions",
+    # ========== Mobius Manifold Constraint ==========
+    "MobiusConstraint",
+    "AdaptiveMobiusConstraint",
+    "create_mobius_constraint",
+    # ========== Resonance Attention ==========
+    "TwistorResonance",
+    "MultiHeadResonance",
+    "create_resonance",
+    # ========== Growable ==========
+    "GrowableTwistorLNN",
+    "create_growable_twistor_lnn",
 ]

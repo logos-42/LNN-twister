@@ -83,6 +83,12 @@ class GrowableTwistorLNN(nn.Module):
         z_max: float = 100.0,
         growth_config: Optional[GrowthConfig] = None,
         enable_growth: bool = True,
+        enable_mobius: bool = False,
+        enable_resonance: bool = False,
+        mobius_strength: float = 0.1,
+        resonance_strength: float = 0.1,
+        learn_manifold_dim: bool = True,
+        sparse_resonance: bool = True,
     ):
         super().__init__()
 
@@ -106,7 +112,21 @@ class GrowableTwistorLNN(nn.Module):
         self._next_innovation = 1
         self.connection_genes: List[ConnectionGene] = []
 
+        self.mobius = None
+        self.resonance = None
+        self._resonance_mode = "additive"
+
         self._init_parameters()
+
+        if enable_mobius or enable_resonance:
+            self._init_mobius_resonance(
+                enable_mobius=enable_mobius,
+                enable_resonance=enable_resonance,
+                mobius_strength=mobius_strength,
+                resonance_strength=resonance_strength,
+                learn_manifold_dim=learn_manifold_dim,
+                sparse_resonance=sparse_resonance,
+            )
 
         self.neuron_states: List[NeuronState] = []
         for i in range(input_dim):
@@ -176,6 +196,37 @@ class GrowableTwistorLNN(nn.Module):
                 self.sparse_mask_real.copy_(mask_real)
                 self.sparse_mask_imag.copy_(mask_imag)
 
+    def _init_mobius_resonance(
+        self,
+        enable_mobius: bool = True,
+        enable_resonance: bool = True,
+        mobius_strength: float = 0.1,
+        resonance_strength: float = 0.1,
+        learn_manifold_dim: bool = True,
+        sparse_resonance: bool = True,
+    ):
+        """初始化莫比乌斯约束和共振注意力"""
+        if enable_mobius:
+            from .mobius import MobiusConstraint
+
+            max_h = self.growth_config.max_hidden_dim
+            self.mobius = MobiusConstraint(
+                max_dim=max(max_h * 4, 512),
+                constraint_strength=mobius_strength,
+                enable_learning=learn_manifold_dim,
+                device=str(self.U.weight.device),
+            )
+
+        if enable_resonance:
+            from .resonance import TwistorResonance
+
+            self.resonance = TwistorResonance(
+                hidden_dim=max(1, self.hidden_dim),
+                resonance_strength=resonance_strength,
+                sparse_mode=sparse_resonance,
+                device=str(self.U.weight.device),
+            )
+
     def compute_tau(self, z: torch.Tensor) -> torch.Tensor:
         if self.hidden_dim == 0:
             return torch.ones_like(z.real) * self.tau_min
@@ -221,6 +272,15 @@ class GrowableTwistorLNN(nn.Module):
         tau = self.compute_tau(z)
         dzdt = torch.complex(dz_real / tau, dz_imag / tau)
 
+        if self.resonance is not None and self.hidden_dim > 0:
+            topo_weights = None
+            if self.mobius is not None:
+                topo_weights = self.mobius.topology_weight_matrix(self.hidden_dim)
+            dzdt_resonance = self.resonance(
+                z, topology_weights=topo_weights, mode=self._resonance_mode
+            )
+            dzdt = dzdt + dzdt_resonance
+
         dzdt_real = torch.clamp(dzdt.real, -self.dzdt_max, self.dzdt_max)
         dzdt_imag = torch.clamp(dzdt.imag, -self.dzdt_max, self.dzdt_max)
         dzdt = torch.complex(dzdt_real, dzdt_imag)
@@ -244,6 +304,10 @@ class GrowableTwistorLNN(nn.Module):
             dzdt = self.compute_dzdt(z, x_t)
 
             z = z + self.dt * dzdt
+
+            if self.mobius is not None and self.hidden_dim > 0:
+                z = self.mobius.project_state(z)
+
             z = torch.complex(
                 torch.clamp(z.real, -self.z_max, self.z_max),
                 torch.clamp(z.imag, -self.z_max, self.z_max),
@@ -872,6 +936,8 @@ class GrowableTwistorLNN(nn.Module):
                                 changes = 1
 
             if action_taken:
+                if self.mobius is not None:
+                    self.mobius.on_dimension_change(self.hidden_dim)
                 return {
                     "action": action_taken,
                     "count": changes,
@@ -931,6 +997,10 @@ class GrowableTwistorLNN(nn.Module):
 
         dzdt = self.compute_dzdt(z, x)
         z_new = z + dt * dzdt
+
+        if self.mobius is not None:
+            z_new = self.mobius.project_state(z_new)
+
         z_new = torch.complex(
             torch.clamp(z_new.real, -self.z_max, self.z_max),
             torch.clamp(z_new.imag, -self.z_max, self.z_max),
@@ -942,6 +1012,12 @@ class GrowableTwistorLNN(nn.Module):
             else self.out(z_new.real)
         )
         return z_new, output
+
+    def get_mobius_info(self) -> Optional[Dict]:
+        """获取莫比乌斯流形当前状态"""
+        if self.mobius is None:
+            return None
+        return self.mobius.get_manifold_info(self.hidden_dim)
 
 
 def create_growable_twistor_lnn(
