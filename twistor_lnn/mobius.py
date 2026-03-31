@@ -61,11 +61,14 @@ class MobiusConstraint(nn.Module):
             )
 
         self.current_manifold_dim = 1
+        self._last_manifold_dim = 1
 
         self.register_buffer("positions", torch.zeros(max_dim))
 
         self._twist_tensor = None
         self._twist_dirty = True
+        self._last_hidden_dim = 0
+        self._last_weights = (self.mobius_weight.item(), self.klein_weight.item())
 
         self.device = device
 
@@ -108,7 +111,21 @@ class MobiusConstraint(nn.Module):
           Θ_mobius[i,j] = π · (i+j) / (2·N)  (莫比乌斯半扭转)
           Θ_klein[i,j] = 2π · (i·j) / N²     (克莱因全局扭转)
         """
-        if self._twist_tensor is not None and not self._twist_dirty:
+        weights_changed = (
+            abs(self.mobius_weight.item() - self._last_weights[0]) > 1e-6
+            or abs(self.klein_weight.item() - self._last_weights[1]) > 1e-6
+        )
+        dim_changed = (
+            hidden_dim != self._last_hidden_dim
+            or manifold_dim != self._last_manifold_dim
+        )
+
+        if (
+            self._twist_tensor is not None
+            and not self._twist_dirty
+            and not weights_changed
+            and not dim_changed
+        ):
             if self._twist_tensor.shape == (hidden_dim, hidden_dim):
                 return self._twist_tensor
 
@@ -133,6 +150,9 @@ class MobiusConstraint(nn.Module):
 
         self._twist_tensor = twist
         self._twist_dirty = False
+        self._last_hidden_dim = hidden_dim
+        self._last_manifold_dim = manifold_dim
+        self._last_weights = (self.mobius_weight.item(), self.klein_weight.item())
 
         return twist
 
@@ -161,10 +181,8 @@ class MobiusConstraint(nn.Module):
         return z_constrained
 
     def topology_distance(self, i: int, j: int, N: int) -> float:
-        """计算流形上的拓扑距离"""
+        """计算流形上的拓扑距离（环距离）"""
         d_ring = min(abs(i - j), N - abs(i - j))
-        if d_ring > N / 2:
-            d_ring = N - d_ring
         return d_ring / N
 
     def topology_weight_matrix(self, N: int) -> torch.Tensor:
@@ -182,7 +200,7 @@ class MobiusConstraint(nn.Module):
         d_ring = torch.min(torch.abs(I - J), N - torch.abs(I - J))
         d_norm = d_ring / N
 
-        sigma = 0.3
+        sigma = 0.3  # Gaussian bandwidth for topology weight decay
         gaussian = torch.exp(-(d_norm**2) / (2 * sigma**2))
 
         mobius_modulation = torch.cos(math.pi * d_norm * manifold_dim)
@@ -250,8 +268,9 @@ class AdaptiveMobiusConstraint(MobiusConstraint):
     def __init__(self, max_dim: int = 512, **kwargs):
         super().__init__(max_dim=max_dim, **kwargs)
 
-        self.per_neuron_strength = nn.Parameter(torch.zeros(max_dim))
-        self.transition_progress = nn.Parameter(torch.tensor(0.0))
+        device = kwargs.get("device", "cpu")
+        self.per_neuron_strength = nn.Parameter(torch.zeros(max_dim, device=device))
+        self.transition_progress = nn.Parameter(torch.tensor(0.0, device=device))
 
     def update_transition(self, step: int, max_steps: int):
         """更新模式过渡进度"""

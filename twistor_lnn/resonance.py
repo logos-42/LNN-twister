@@ -18,7 +18,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class TwistorResonance(nn.Module):
@@ -52,6 +52,8 @@ class TwistorResonance(nn.Module):
 
         self.phase_sensitivity = nn.Parameter(torch.tensor(1.0))
 
+        self.topology_threshold = nn.Parameter(torch.tensor(0.1))
+
     def compute_amplitude(self, z: torch.Tensor) -> torch.Tensor:
         """计算振幅 |z|"""
         return torch.abs(z)
@@ -74,7 +76,8 @@ class TwistorResonance(nn.Module):
         delta_phi = phi.unsqueeze(2) - phi.unsqueeze(1)
 
         phase_term = torch.cos(delta_phi * self.phase_sensitivity).abs()
-        phase_term = phase_term ** (self.kernel_scale.exp() + self.kernel_bias)
+        exponent = F.softplus(self.kernel_scale) + F.softplus(self.kernel_bias) + 1e-6
+        phase_term = phase_term.clamp(min=1e-10) ** exponent
 
         amp_outer = amp.unsqueeze(2) * amp.unsqueeze(1)
 
@@ -95,7 +98,7 @@ class TwistorResonance(nn.Module):
         R_full = self.compute_resonance_matrix(z)
 
         if topology_weights is not None and self.use_topology_mask:
-            mask = (topology_weights.abs() > 0.1).float()
+            mask = (topology_weights.abs() > self.topology_threshold.abs()).float()
             R_sparse = R_full * mask.unsqueeze(0).expand(B, -1, -1)
         else:
             R_sparse = self._topk_sparsify(R_full, self.sparse_k)
@@ -106,9 +109,10 @@ class TwistorResonance(nn.Module):
         """Top-k 稀疏化"""
         B, N, _ = R.shape
         R_flat = R.view(B, -1)
+        total = R_flat.shape[1]
 
-        k_val = min(k * N, R_flat.shape[1])
-        threshold = R_flat.kthvalue(R_flat.shape[1] - k_val, dim=1, keepdim=True).values
+        k_val = min(max(k * N, 1), total - 1)
+        threshold = R_flat.kthvalue(total - k_val, dim=1, keepdim=True).values
 
         mask = (R_flat >= threshold).float()
         R_sparse = R_flat * mask
@@ -181,33 +185,30 @@ class MultiHeadResonance(nn.Module):
     """
     多共振头注意力
 
-    类似多头注意力，但每个头学习不同的共振核函数
+    类似多头注意力，但每个头学习不同的共振核函数。
+    每个头处理完整的输入维度，输出加权组合。
     """
 
     def __init__(self, hidden_dim: int, num_heads: int = 4, **kwargs):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
 
         self.heads = nn.ModuleList(
-            [TwistorResonance(self.head_dim, **kwargs) for _ in range(num_heads)]
+            [TwistorResonance(hidden_dim, **kwargs) for _ in range(num_heads)]
         )
 
         self.head_weights = nn.Parameter(torch.ones(num_heads))
 
     def forward(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
-        B, N = z.shape
-
-        z_heads = z.view(B, self.num_heads, self.head_dim)
-
         outputs = []
-        for i, head in enumerate(self.heads):
-            z_h = z_heads[:, i, :]
-            out_h = head(z_h, **kwargs)
+        for head in self.heads:
+            out_h = head(z, **kwargs)
             outputs.append(out_h)
 
+        stacked = torch.stack(outputs, dim=0)
         weights = F.softmax(self.head_weights, dim=0)
-        result = sum(w * o for w, o in zip(weights, outputs))
+        result = (weights.view(-1, 1, 1) * stacked).sum(dim=0)
 
         return result
 

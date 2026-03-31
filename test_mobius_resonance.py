@@ -1,11 +1,11 @@
 """
-测试莫比乌斯约束和扭量共振注意力
-=================================
-验证:
-1. 莫比乌斯约束基础功能
-2. 共振注意力基础功能
-3. 集成到 TwistorLNN
-4. 集成到 GrowableTwistorLNN (自生长+升维联动)
+Test Mobius Manifold Constraint and Twistor Resonance Attention
+===============================================================
+Validates:
+1. Mobius constraint basic functionality
+2. Resonance attention basic functionality
+3. Integration with TwistorLNN
+4. Integration with GrowableTwistorLNN (self-growth + dimension evolution)
 """
 
 import torch
@@ -15,39 +15,45 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from twistor_lnn.core import TwistorLNN
-from twistor_lnn.mobius import MobiusConstraint
-from twistor_lnn.resonance import TwistorResonance
+from twistor_lnn.mobius import MobiusConstraint, AdaptiveMobiusConstraint
+from twistor_lnn.resonance import TwistorResonance, MultiHeadResonance
 from twistor_lnn.growable import GrowableTwistorLNN
 
 
 def test_mobius_basic():
-    """测试莫比乌斯约束基础功能"""
-    print("\n1. 莫比乌斯约束基础测试")
+    """Test Mobius constraint basic functionality"""
+    print("\n1. Mobius Constraint Basic Test")
     print("-" * 40)
 
     mobius = MobiusConstraint(max_dim=256, enable_learning=True)
 
     for n in [4, 16, 64, 128]:
         dim = mobius.compute_manifold_dimension(n)
-        print(f"  hidden_dim={n:4d} → manifold_dim={dim}")
+        assert 1 <= dim <= 8, f"manifold_dim {dim} out of range for hidden_dim={n}"
+        print(f"  hidden_dim={n:4d} -> manifold_dim={dim}")
 
     z = torch.randn(2, 32, dtype=torch.complex64)
     z_proj = mobius.project_state(z)
+    assert z_proj.shape == z.shape, f"Shape mismatch: {z_proj.shape} vs {z.shape}"
     diff = (z - z_proj).abs().mean().item()
-    print(f"  投影前后差异: {diff:.6f}")
+    assert diff > 0, "Projection should change the state"
+    print(f"  Projection difference: {diff:.6f}")
 
     W = mobius.topology_weight_matrix(32)
-    print(f"  拓扑权重形状: {W.shape}, 范围: [{W.min():.4f}, {W.max():.4f}]")
+    assert W.shape == (32, 32), f"Topology weight shape mismatch: {W.shape}"
+    print(f"  Topology weight shape: {W.shape}, range: [{W.min():.4f}, {W.max():.4f}]")
 
     info = mobius.get_manifold_info(32)
-    print(f"  流形模式: {info['mode']}, 维度: {info['manifold_dim']}")
+    assert info["manifold_dim"] >= 1
+    assert info["mode"] in ("mobius", "klein", "mixed")
+    print(f"  Manifold mode: {info['mode']}, dim: {info['manifold_dim']}")
 
-    print("  ✅ 莫比乌斯约束测试通过")
+    print("  PASSED")
 
 
 def test_resonance_basic():
-    """测试共振注意力基础功能"""
-    print("\n2. 扭量共振注意力基础测试")
+    """Test resonance attention basic functionality"""
+    print("\n2. Twistor Resonance Attention Basic Test")
     print("-" * 40)
 
     resonance = TwistorResonance(hidden_dim=32, resonance_strength=0.1)
@@ -55,28 +61,34 @@ def test_resonance_basic():
     z = torch.randn(2, 32, dtype=torch.complex64)
     dzdt = resonance(z)
 
-    print(f"  共振输出形状: {dzdt.shape}")
-    print(f"  共振强度: {resonance.resonance_strength.item():.4f}")
+    assert dzdt.shape == z.shape, f"Shape mismatch: {dzdt.shape} vs {z.shape}"
+    print(f"  Resonance output shape: {dzdt.shape}")
+    print(f"  Resonance strength: {resonance.resonance_strength.item():.4f}")
 
     R = resonance.compute_resonance_matrix(z)
-    print(f"  共振矩阵形状: {R.shape}")
-    print(f"  共振分数范围: [{R.min():.4f}, {R.max():.4f}]")
+    assert R.shape == (2, 32, 32), f"Resonance matrix shape mismatch: {R.shape}"
+    assert not torch.isnan(R).any(), "Resonance matrix contains NaN"
+    assert not torch.isinf(R).any(), "Resonance matrix contains Inf"
+    print(f"  Resonance matrix shape: {R.shape}")
+    print(f"  Resonance score range: [{R.min():.4f}, {R.max():.4f}]")
 
-    print("  ✅ 共振注意力测试通过")
+    print("  PASSED")
 
 
 def test_integrated_core():
-    """测试集成到 TwistorLNN"""
-    print("\n3. 集成到 TwistorLNN 测试")
+    """Test integration with TwistorLNN"""
+    print("\n3. Integration with TwistorLNN Test")
     print("-" * 40)
 
     model = TwistorLNN(input_dim=4, hidden_dim=32, output_dim=2)
 
-    print(f"  基础模型参数: {sum(p.numel() for p in model.parameters()):,}")
+    base_params = sum(p.numel() for p in model.parameters())
+    print(f"  Base model parameters: {base_params:,}")
 
     x = torch.randn(20, 2, 4)
     y_base = model(x)
-    print(f"  基础输出形状: {y_base.shape}")
+    assert y_base.shape == (20, 2, 2), f"Output shape mismatch: {y_base.shape}"
+    print(f"  Base output shape: {y_base.shape}")
 
     model.enable_mobius_resonance(
         enable_mobius=True,
@@ -85,24 +97,29 @@ def test_integrated_core():
         resonance_strength=0.05,
     )
 
-    print(f"  启用后参数: {sum(p.numel() for p in model.parameters()):,}")
+    mr_params = sum(p.numel() for p in model.parameters())
+    assert mr_params > base_params, (
+        "Parameters should increase after enabling mobius+resonance"
+    )
+    print(f"  Parameters after enabling: {mr_params:,}")
 
     y_mr = model(x)
-    print(f"  莫比乌斯+共振输出形状: {y_mr.shape}")
+    assert y_mr.shape == y_base.shape, f"Output shape mismatch: {y_mr.shape}"
+    print(f"  Mobius+Resonance output shape: {y_mr.shape}")
 
     info = model.get_mobius_info()
-    if info:
-        print(f"  流形模式: {info['mode']}, 维度: {info['manifold_dim']}")
+    assert info is not None, "Mobius info should not be None"
+    print(f"  Manifold mode: {info['mode']}, dim: {info['manifold_dim']}")
 
     diff = (y_base - y_mr).abs().mean().item()
-    print(f"  基础 vs 增强差异: {diff:.6f}")
+    print(f"  Base vs Enhanced difference: {diff:.6f}")
 
-    print("  ✅ 集成模型测试通过")
+    print("  PASSED")
 
 
 def test_integrated_growable():
-    """测试集成到 GrowableTwistorLNN (自生长+升维联动)"""
-    print("\n4. 集成到 GrowableTwistorLNN 测试")
+    """Test integration with GrowableTwistorLNN"""
+    print("\n4. Integration with GrowableTwistorLNN Test")
     print("-" * 40)
 
     model = GrowableTwistorLNN(
@@ -116,29 +133,33 @@ def test_integrated_growable():
         resonance_strength=0.05,
     )
 
-    print(f"  初始 hidden_dim: {model.hidden_dim}")
-    print(f"  莫比乌斯启用: {model.mobius is not None}")
-    print(f"  共振启用: {model.resonance is not None}")
+    assert model.hidden_dim == 0
+    assert model.mobius is not None
+    assert model.resonance is not None
+    print(f"  Initial hidden_dim: {model.hidden_dim}")
+    print(f"  Mobius enabled: {model.mobius is not None}")
+    print(f"  Resonance enabled: {model.resonance is not None}")
 
     x = torch.randn(30, 2, 4)
     y = model(x)
-    print(f"  输出形状: {y.shape}")
+    assert y.shape == (30, 2, 2), f"Output shape mismatch: {y.shape}"
+    print(f"  Output shape: {y.shape}")
 
     for i in range(5):
         model.growth_step()
 
-    print(f"  增长后 hidden_dim: {model.hidden_dim}")
+    print(f"  After growth hidden_dim: {model.hidden_dim}")
 
     if model.mobius is not None:
         info = model.mobius.get_manifold_info(model.hidden_dim)
-        print(f"  流形模式: {info['mode']}, 维度: {info['manifold_dim']}")
+        print(f"  Manifold mode: {info['mode']}, dim: {info['manifold_dim']}")
 
-    print("  ✅ 可增长模型集成测试通过")
+    print("  PASSED")
 
 
 def test_mobius_dimension_evolution():
-    """测试莫比乌斯维度进化"""
-    print("\n5. 莫比乌斯维度进化测试")
+    """Test Mobius dimension evolution"""
+    print("\n5. Mobius Dimension Evolution Test")
     print("-" * 40)
 
     mobius = MobiusConstraint(max_dim=1024, enable_learning=True)
@@ -148,22 +169,22 @@ def test_mobius_dimension_evolution():
     prev_dim = 0
     for n in test_dims:
         m_dim = mobius.compute_manifold_dimension(n)
-        changed = " ↑" if m_dim > prev_dim else ""
-        print(f"  neurons={n:4d} → manifold_dim={m_dim}{changed}")
+        assert 1 <= m_dim <= 8, f"manifold_dim {m_dim} out of range for n={n}"
+        changed = " ^" if m_dim > prev_dim else ""
+        print(f"  neurons={n:4d} -> manifold_dim={m_dim}{changed}")
         prev_dim = m_dim
 
-    print("  ✅ 维度进化测试通过")
+    print("  PASSED")
 
 
 def test_mobius_klein_transition():
-    """测试莫比乌斯→克莱因混合模式"""
-    print("\n6. 莫比乌斯→克莱因混合模式测试")
+    """Test Mobius -> Klein mixed mode transition"""
+    print("\n6. Mobius -> Klein Mixed Mode Transition Test")
     print("-" * 40)
-
-    from twistor_lnn.mobius import AdaptiveMobiusConstraint
 
     mobius = AdaptiveMobiusConstraint(max_dim=128, mobius_weight=1.0, klein_weight=0.0)
 
+    prev_mobius = 1.0
     for step_pct in [0.0, 0.25, 0.5, 0.75, 1.0]:
         mobius.update_transition(int(step_pct * 100), 100)
 
@@ -171,16 +192,20 @@ def test_mobius_klein_transition():
         beta = torch.sigmoid(mobius.klein_weight).item()
         total = alpha + beta + 1e-6
 
+        mobius_ratio = alpha / total
+        klein_ratio = beta / total
+
+        assert mobius_ratio + klein_ratio > 0.99, "Ratios should sum to ~1"
         print(
-            f"  progress={step_pct:.2f} → mobius={alpha / total:.3f}, klein={beta / total:.3f}"
+            f"  progress={step_pct:.2f} -> mobius={mobius_ratio:.3f}, klein={klein_ratio:.3f}"
         )
 
-    print("  ✅ 混合模式过渡测试通过")
+    print("  PASSED")
 
 
 def test_resonance_modes():
-    """测试共振注意力的不同应用模式"""
-    print("\n7. 共振注意力模式测试")
+    """Test resonance attention different application modes"""
+    print("\n7. Resonance Attention Modes Test")
     print("-" * 40)
 
     resonance = TwistorResonance(hidden_dim=16, resonance_strength=0.1)
@@ -188,16 +213,66 @@ def test_resonance_modes():
 
     for mode in ["additive", "multiplicative", "gating"]:
         dzdt = resonance(z, mode=mode)
+        assert dzdt.shape == z.shape, f"Shape mismatch for mode={mode}: {dzdt.shape}"
+        assert not torch.isnan(dzdt).any(), f"NaN detected for mode={mode}"
         print(
-            f"  mode={mode:15s} → output shape: {dzdt.shape}, mean: {dzdt.abs().mean():.4f}"
+            f"  mode={mode:15s} -> output shape: {dzdt.shape}, mean: {dzdt.abs().mean():.4f}"
         )
 
-    print("  ✅ 共振模式测试通过")
+    print("  PASSED")
+
+
+def test_multihead_resonance():
+    """Test MultiHeadResonance with valid configurations"""
+    print("\n8. MultiHead Resonance Test")
+    print("-" * 40)
+
+    z = torch.randn(2, 32, dtype=torch.complex64)
+
+    head = MultiHeadResonance(hidden_dim=32, num_heads=4)
+    out = head(z)
+    assert out.shape == z.shape, f"Shape mismatch: {out.shape} vs {z.shape}"
+    print(f"  32-dim, 4 heads -> output shape: {out.shape}")
+
+    head2 = MultiHeadResonance(hidden_dim=33, num_heads=4)
+    out2 = head2(torch.randn(2, 33, dtype=torch.complex64))
+    assert out2.shape == (2, 33), f"Shape mismatch for 33-dim: {out2.shape}"
+    print(f"  33-dim, 4 heads -> output shape: {out2.shape} (no restriction)")
+
+    print("  PASSED")
+
+
+def test_resonance_numerical_stability():
+    """Test resonance numerical stability with extreme inputs"""
+    print("\n9. Resonance Numerical Stability Test")
+    print("-" * 40)
+
+    resonance = TwistorResonance(hidden_dim=16, resonance_strength=0.1)
+
+    z_zero = torch.zeros(2, 16, dtype=torch.complex64)
+    out_zero = resonance(z_zero)
+    assert not torch.isnan(out_zero).any(), "NaN with zero input"
+    assert not torch.isinf(out_zero).any(), "Inf with zero input"
+    print(f"  Zero input -> no NaN/Inf")
+
+    z_large = torch.randn(2, 16, dtype=torch.complex64) * 100
+    out_large = resonance(z_large)
+    assert not torch.isnan(out_large).any(), "NaN with large input"
+    assert not torch.isinf(out_large).any(), "Inf with large input"
+    print(f"  Large input -> no NaN/Inf")
+
+    resonance.kernel_bias.data = torch.tensor(-10.0)
+    out_neg_exp = resonance(z_large)
+    assert not torch.isnan(out_neg_exp).any(), "NaN with negative exponent"
+    assert not torch.isinf(out_neg_exp).any(), "Inf with negative exponent"
+    print(f"  Negative exponent -> no NaN/Inf")
+
+    print("  PASSED")
 
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("莫比乌斯约束 + 扭量共振 完整测试")
+    print("Mobius Constraint + Twistor Resonance Full Test")
     print("=" * 50)
 
     test_mobius_basic()
@@ -207,7 +282,9 @@ if __name__ == "__main__":
     test_mobius_dimension_evolution()
     test_mobius_klein_transition()
     test_resonance_modes()
+    test_multihead_resonance()
+    test_resonance_numerical_stability()
 
     print("\n" + "=" * 50)
-    print("所有测试通过!")
+    print("ALL TESTS PASSED!")
     print("=" * 50)
