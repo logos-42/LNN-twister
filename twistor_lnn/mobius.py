@@ -72,13 +72,22 @@ class MobiusConstraint(nn.Module):
 
         self.device = device
 
+    def _get_device(self):
+        """Dynamically get device from parameters"""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device(self.device)
+
     def compute_manifold_dimension(self, hidden_dim: int) -> int:
         """计算当前流形维度 - 可学习决定"""
         if not self.enable_learning:
             return self._rule_based_dimension(hidden_dim)
 
         x = torch.tensor(
-            [[hidden_dim / self.max_dim]], dtype=torch.float32, device=self.device
+            [[hidden_dim / self.max_dim]],
+            dtype=torch.float32,
+            device=self._get_device(),
         )
         logits = self.dimension_decoder(x)
         dim_idx = logits.argmax(dim=-1).item()
@@ -132,8 +141,8 @@ class MobiusConstraint(nn.Module):
         N = hidden_dim
         d = manifold_dim
 
-        i = torch.arange(N, dtype=torch.float32, device=self.device)
-        j = torch.arange(N, dtype=torch.float32, device=self.device)
+        i = torch.arange(N, dtype=torch.float32, device=self._get_device())
+        j = torch.arange(N, dtype=torch.float32, device=self._get_device())
         I, J = torch.meshgrid(i, j, indexing="ij")
 
         twist_mobius = math.pi * (I + J) / (2 * N) * d
@@ -166,10 +175,10 @@ class MobiusConstraint(nn.Module):
         B, N = z.shape
         manifold_dim = self.compute_manifold_dimension(N)
 
-        self.positions[:N] = torch.linspace(0, 1, N, device=self.device)
+        self.positions[:N] = torch.linspace(0, 1, N, device=self._get_device())
         twist = self.compute_twist_tensor(N, manifold_dim)
 
-        pos = self.positions[:N]
+        pos = torch.linspace(0, 1, N, device=self._get_device())
         twist_phase = twist @ pos
 
         twist_factor = torch.exp(1j * twist_phase)
@@ -193,8 +202,8 @@ class MobiusConstraint(nn.Module):
         """
         manifold_dim = self.compute_manifold_dimension(N)
 
-        i = torch.arange(N, dtype=torch.float32, device=self.device)
-        j = torch.arange(N, dtype=torch.float32, device=self.device)
+        i = torch.arange(N, dtype=torch.float32, device=self._get_device())
+        j = torch.arange(N, dtype=torch.float32, device=self._get_device())
         I, J = torch.meshgrid(i, j, indexing="ij")
 
         d_ring = torch.min(torch.abs(I - J), N - torch.abs(I - J))
