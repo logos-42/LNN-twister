@@ -70,6 +70,9 @@ class MobiusConstraint(nn.Module):
         self._last_hidden_dim = 0
         self._last_weights = (self.mobius_weight.item(), self.klein_weight.item())
 
+        self._topo_cache = None
+        self._topo_cache_N = 0
+
         self.device = device
 
     def _get_device(self):
@@ -196,10 +199,13 @@ class MobiusConstraint(nn.Module):
 
     def topology_weight_matrix(self, N: int) -> torch.Tensor:
         """
-        计算拓扑距离调制矩阵
+        计算拓扑距离调制矩阵 (带缓存)
 
         W_topology[i,j] = exp(-d(i,j)² / (2σ²)) · cos(π · d(i,j))
         """
+        if self._topo_cache is not None and self._topo_cache_N == N:
+            return self._topo_cache
+
         manifold_dim = self.compute_manifold_dimension(N)
 
         i = torch.arange(N, dtype=torch.float32, device=self._get_device())
@@ -220,6 +226,9 @@ class MobiusConstraint(nn.Module):
         W_topo = gaussian * (
             alpha * mobius_modulation + beta * torch.cos(2 * math.pi * d_norm)
         )
+
+        self._topo_cache = W_topo
+        self._topo_cache_N = N
 
         return W_topo
 

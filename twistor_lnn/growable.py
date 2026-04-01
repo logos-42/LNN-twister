@@ -52,10 +52,15 @@ class GrowthConfig:
     prune_threshold: float = 0.05
     connection_threshold: float = 0.01
 
-    growth_interval: int = 50
+    growth_interval: int = 10
     prune_interval: int = 25
 
     topology_penalty: float = 0.001
+
+    # Aggressive growth mode
+    aggressive_growth: bool = False
+    aggressive_growth_steps: int = 5
+    aggressive_growth_target: int = 8
 
 
 class GrowableTwistorLNN(nn.Module):
@@ -407,9 +412,8 @@ class GrowableTwistorLNN(nn.Module):
         return self._next_innovation - 1
 
     def _expand_parameters(self, new_dim: int):
+        """Expand parameters from old_dim to new_dim"""
         old_dim = self.hidden_dim
-        if old_dim == 0:
-            old_dim = 1
 
         with torch.no_grad():
             new_W_real = torch.zeros(new_dim, new_dim)
@@ -418,11 +422,14 @@ class GrowableTwistorLNN(nn.Module):
             new_mask_real = torch.ones(new_dim, new_dim) * -5
             new_mask_imag = torch.ones(new_dim, new_dim) * -5
 
-            if self.hidden_dim > 0:
+            if old_dim > 0:
                 new_W_real[:old_dim, :old_dim] = self.W_real.weight.data
                 new_W_imag[:old_dim, :old_dim] = self.W_imag.weight.data
                 new_W_tau[:old_dim, :old_dim] = self.W_tau.weight.data
                 new_mask_real[:old_dim, :old_dim] = self.sparse_mask_real.data[
+                    :old_dim, :old_dim
+                ]
+                new_mask_imag[:old_dim, :old_dim] = self.sparse_mask_imag.data[
                     :old_dim, :old_dim
                 ]
                 new_mask_imag[:old_dim, :old_dim] = self.sparse_mask_imag.data[
@@ -442,7 +449,7 @@ class GrowableTwistorLNN(nn.Module):
 
             new_b_real = torch.zeros(new_dim)
             new_b_imag = torch.zeros(new_dim)
-            if self.hidden_dim > 0:
+            if old_dim > 0:
                 new_b_real[:old_dim] = self.b_real.data[:old_dim]
                 new_b_imag[:old_dim] = self.b_imag.data[:old_dim]
             self.b_real = nn.Parameter(new_b_real)
@@ -450,15 +457,21 @@ class GrowableTwistorLNN(nn.Module):
 
             if self.tau_bias is not None:
                 new_tau = torch.zeros(new_dim)
-                if self.hidden_dim > 0:
+                if old_dim > 0:
                     new_tau[:old_dim] = self.tau_bias.data[:old_dim]
                 self.tau_bias = nn.Parameter(new_tau)
 
             new_out = nn.Linear(new_dim, self.output_dim)
-            if self.hidden_dim > 0:
+            if old_dim > 0:
                 new_out.weight.data[:, :old_dim] = self.out.weight.data[:, :old_dim]
                 new_out.bias.data = self.out.bias.data
             self.out = new_out
+
+            new_U = nn.Linear(self.input_dim, new_dim)
+            if old_dim > 0:
+                new_U.weight.data[:old_dim, :] = self.U.weight.data[:old_dim, :]
+                new_U.bias.data[:old_dim] = self.U.bias.data[:old_dim]
+            self.U = new_U
 
     def add_connection(self, in_node: int, out_node: int) -> bool:
         """添加新连接 - NEAT Add Connection Mutation"""
@@ -820,6 +833,11 @@ class GrowableTwistorLNN(nn.Module):
 
             self.W_real = nn.Linear(1, 1, bias=False)
             self.W_imag = nn.Linear(1, 1, bias=False)
+            self.W_tau = nn.Linear(1, 1)
+            nn.init.orthogonal_(self.W_real.weight, gain=0.5)
+            nn.init.orthogonal_(self.W_imag.weight, gain=0.5)
+            nn.init.orthogonal_(self.W_tau.weight, gain=0.1)
+            nn.init.zeros_(self.W_tau.bias)
             self.W_real.weight.data = new_W_real
             self.W_imag.weight.data = new_W_imag
 
@@ -898,7 +916,8 @@ class GrowableTwistorLNN(nn.Module):
             action_taken = None
             changes = 0
 
-            if self.hidden_dim == 0 and self.training_step > 50:
+            init_threshold = 10 if self.growth_config.aggressive_growth else 50
+            if self.hidden_dim == 0 and self.training_step > init_threshold:
                 new_idx = self.add_first_neuron()
                 if new_idx >= 0:
                     return {
@@ -960,6 +979,42 @@ class GrowableTwistorLNN(nn.Module):
                 }
 
         return {"action": "none", "changes": 0}
+
+    def force_grow_to(self, target_dim: int):
+        """
+        强制增长到目标维度 (用于预生长)
+        绕过概率和过载检查，直接分裂神经元
+        """
+        while (
+            self.hidden_dim < target_dim
+            and self.hidden_dim < self.growth_config.max_hidden_dim
+        ):
+            if self.hidden_dim == 0:
+                idx = self.add_first_neuron()
+                if idx < 0:
+                    break
+            else:
+                overloaded = self.get_overloaded_neurons()
+                if overloaded:
+                    parent_idx = overloaded[torch.randint(len(overloaded), (1,)).item()]
+                else:
+                    active_hidden = [
+                        s.index - self.input_dim - self.output_dim
+                        for s in self.neuron_states
+                        if s.active and s.neuron_type == "hidden"
+                    ]
+                    if not active_hidden:
+                        break
+                    parent_idx = active_hidden[
+                        torch.randint(len(active_hidden), (1,)).item()
+                    ]
+
+                new_idx = self.split_neuron(parent_idx)
+                if new_idx < 0:
+                    break
+
+            if self.mobius is not None:
+                self.mobius.on_dimension_change(self.hidden_dim)
 
     def get_diagnostics(self) -> Dict:
         importance = self.compute_importance_scores()

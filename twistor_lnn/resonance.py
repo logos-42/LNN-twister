@@ -54,6 +54,9 @@ class TwistorResonance(nn.Module):
 
         self.topology_threshold = nn.Parameter(torch.tensor(0.1))
 
+        self._topo_cache = None
+        self._topo_cache_N = 0
+
     def compute_amplitude(self, z: torch.Tensor) -> torch.Tensor:
         """计算振幅 |z|"""
         return torch.abs(z)
@@ -98,7 +101,12 @@ class TwistorResonance(nn.Module):
         R_full = self.compute_resonance_matrix(z)
 
         if topology_weights is not None and self.use_topology_mask:
-            mask = (topology_weights.abs() > self.topology_threshold.abs()).float()
+            if self._topo_cache is None or self._topo_cache_N != N:
+                mask = (topology_weights.abs() > self.topology_threshold.abs()).float()
+                self._topo_cache = mask
+                self._topo_cache_N = N
+            else:
+                mask = self._topo_cache
             R_sparse = R_full * mask.unsqueeze(0).expand(B, -1, -1)
         else:
             R_sparse = self._topk_sparsify(R_full, self.sparse_k)
