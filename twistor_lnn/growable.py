@@ -7,6 +7,7 @@
 3. Disable Connection - 禁用连接(剪枝)
 4. 从最小结构开始(0隐藏节点)
 5. 扭量复数状态空间
+6. 流形几何约束 - 权重和生长在莫比乌斯-克莱因流形上
 """
 
 import torch
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 import numpy as np
+import math
 
 
 @dataclass
@@ -39,11 +41,33 @@ class NeuronState:
     importance_score: float = 0.0
     usage_count: int = 0
 
+    consolidation_score: float = 0.0
+    decay_counter: float = 0.0
+    survival_threshold: float = 0.0
+    recent_activity: float = 0.0
+    life_span: int = 0
+    peak_activation: float = 0.0
+
+
+@dataclass
+class DevelopmentalPhase:
+    """发育阶段定义 - 模拟人类大脑发育"""
+
+    name: str
+    start_step: int
+    end_step: int
+    target_neurons: int
+    target_connections_per_neuron: int
+    growth_rate: float
+    prune_rate: float
+    plasticity: float
+    description: str
+
 
 @dataclass
 class GrowthConfig:
     min_hidden_dim: int = 0
-    max_hidden_dim: int = 128
+    max_hidden_dim: int = 8192
 
     prob_add_connection: float = 0.05
     prob_add_node: float = 0.03
@@ -57,10 +81,88 @@ class GrowthConfig:
 
     topology_penalty: float = 0.001
 
-    # Aggressive growth mode
     aggressive_growth: bool = False
     aggressive_growth_steps: int = 5
     aggressive_growth_target: int = 8
+
+    consolidation_rate: float = 0.02
+    decay_rate: float = 0.01
+    survival_threshold: float = 0.15
+
+    developmental_phases: List[DevelopmentalPhase] = None
+    enable_developmental_schedule: bool = True
+
+    def __post_init__(self):
+        if self.developmental_phases is None and self.enable_developmental_schedule:
+            self.developmental_phases = self._create_brain_development_schedule()
+
+    def _create_brain_development_schedule(self) -> List[DevelopmentalPhase]:
+        """创建人类大脑发育时间表 (×100量级)
+
+        5个阶段:
+        1. 胎儿期: 结构生成 (6400神经元)
+        2. 0-2岁: 连接爆炸 (600连接/神经元, 成人2倍)
+        3. 3-10岁: 修剪优化 (300连接/神经元)
+        4. 青春期: 系统重构 (400连接/神经元)
+        5. 20-30岁: 整合巅峰 (300连接/神经元, 收敛)
+        """
+        return [
+            DevelopmentalPhase(
+                name="fetal",
+                start_step=0,
+                end_step=100,
+                target_neurons=6400,
+                target_connections_per_neuron=2,
+                growth_rate=0.8,
+                prune_rate=0.0,
+                plasticity=1.0,
+                description="胎儿期: 6400神经元生成,硬件搭建",
+            ),
+            DevelopmentalPhase(
+                name="infant",
+                start_step=100,
+                end_step=300,
+                target_neurons=6400,
+                target_connections_per_neuron=600,
+                growth_rate=0.1,
+                prune_rate=0.02,
+                plasticity=1.0,
+                description="婴儿期(0-2岁): 连接爆炸,600连接/神经元(成人2倍)",
+            ),
+            DevelopmentalPhase(
+                name="child",
+                start_step=300,
+                end_step=600,
+                target_neurons=4800,
+                target_connections_per_neuron=300,
+                growth_rate=0.05,
+                prune_rate=0.3,
+                plasticity=0.7,
+                description="儿童期(3-10岁): 修剪优化,300连接/神经元",
+            ),
+            DevelopmentalPhase(
+                name="adolescent",
+                start_step=600,
+                end_step=900,
+                target_neurons=6400,
+                target_connections_per_neuron=400,
+                growth_rate=0.4,
+                prune_rate=0.15,
+                plasticity=0.8,
+                description="青春期(10-20岁): 系统重构,400连接/神经元",
+            ),
+            DevelopmentalPhase(
+                name="adult",
+                start_step=900,
+                end_step=1500,
+                target_neurons=4800,
+                target_connections_per_neuron=300,
+                growth_rate=0.05,
+                prune_rate=0.1,
+                plasticity=0.3,
+                description="成年期(20-30岁): 整合巅峰,300连接/神经元,收敛",
+            ),
+        ]
 
 
 class GrowableTwistorLNN(nn.Module):
@@ -121,7 +223,11 @@ class GrowableTwistorLNN(nn.Module):
         self.resonance = None
         self._resonance_mode = "additive"
 
-        self._init_parameters()
+        self.manifold_geometry = None
+        self.weight_initializer = None
+        self.growth_planner = None
+
+        self._preallocate_parameters()
 
         if enable_mobius or enable_resonance:
             self._init_mobius_resonance(
@@ -132,6 +238,8 @@ class GrowableTwistorLNN(nn.Module):
                 learn_manifold_dim=learn_manifold_dim,
                 sparse_resonance=sparse_resonance,
             )
+
+        self._init_manifold_geometry()
 
         self.neuron_states: List[NeuronState] = []
         for i in range(input_dim):
@@ -155,40 +263,63 @@ class GrowableTwistorLNN(nn.Module):
         self._activation_buffer = []
         self._max_buffer_size = 100
 
-    def _init_parameters(self):
-        self.W_real = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.W_imag = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.U = nn.Linear(self.input_dim, self.hidden_dim)
-        self.W_tau = nn.Linear(self.hidden_dim, self.hidden_dim)
+    def _preallocate_parameters(self):
+        """预分配最大尺寸参数 - 避免增长时O(n²)重建"""
+        max_h = self.growth_config.max_hidden_dim
 
-        self.sparse_mask_real = nn.Parameter(
-            torch.ones(max(1, self.hidden_dim), max(1, self.hidden_dim))
-        )
-        self.sparse_mask_imag = nn.Parameter(
-            torch.ones(max(1, self.hidden_dim), max(1, self.hidden_dim))
-        )
+        self.W_real = nn.Linear(max_h, max_h, bias=False)
+        self.W_imag = nn.Linear(max_h, max_h, bias=False)
+        self.U = nn.Linear(self.input_dim, max_h)
+        self.W_tau = nn.Linear(max_h, max_h)
+
+        self.sparse_mask_real = nn.Parameter(torch.ones(max_h, max_h) * -5)
+        self.sparse_mask_imag = nn.Parameter(torch.ones(max_h, max_h) * -5)
 
         if self.multi_scale_tau:
-            self.tau_bias = nn.Parameter(torch.zeros(max(1, self.hidden_dim)))
+            self.tau_bias = nn.Parameter(torch.zeros(max_h))
         else:
             self.register_parameter("tau_bias", None)
 
-        self.b_real = nn.Parameter(torch.zeros(max(1, self.hidden_dim)))
-        self.b_imag = nn.Parameter(torch.zeros(max(1, self.hidden_dim)))
+        self.b_real = nn.Parameter(torch.zeros(max_h))
+        self.b_imag = nn.Parameter(torch.zeros(max_h))
 
-        self.out = nn.Linear(self.hidden_dim, self.output_dim)
+        self.out = nn.Linear(max_h, self.output_dim)
 
-        self._init_weights()
+        if self.hidden_dim > 0:
+            nn.init.orthogonal_(
+                self.W_real.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
+            )
+            nn.init.orthogonal_(
+                self.W_imag.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
+            )
+            nn.init.orthogonal_(self.U.weight[: self.hidden_dim, :], gain=0.5)
+            nn.init.orthogonal_(
+                self.W_tau.weight[: self.hidden_dim, : self.hidden_dim], gain=0.1
+            )
+        else:
+            nn.init.orthogonal_(self.U.weight, gain=0.5)
+
+        nn.init.zeros_(self.b_real)
+        nn.init.zeros_(self.b_imag)
+
+    def _init_parameters(self):
+        """兼容旧接口 - 使用预分配"""
+        self._preallocate_parameters()
 
     def _init_weights(self):
         if self.hidden_dim > 0:
-            nn.init.orthogonal_(self.W_real.weight, gain=0.5)
-            nn.init.orthogonal_(self.W_imag.weight, gain=0.5)
-        nn.init.orthogonal_(self.U.weight, gain=0.5)
-        if self.hidden_dim > 0:
-            nn.init.orthogonal_(self.W_tau.weight, gain=0.1)
-        nn.init.zeros_(self.b_real)
-        nn.init.zeros_(self.b_imag)
+            nn.init.orthogonal_(
+                self.W_real.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
+            )
+            nn.init.orthogonal_(
+                self.W_imag.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
+            )
+            nn.init.orthogonal_(self.U.weight[: self.hidden_dim, :], gain=0.5)
+            nn.init.orthogonal_(
+                self.W_tau.weight[: self.hidden_dim, : self.hidden_dim], gain=0.1
+            )
+        nn.init.zeros_(self.b_real[: self.hidden_dim])
+        nn.init.zeros_(self.b_imag[: self.hidden_dim])
 
         if self.sparsity > 0 and self.hidden_dim > 0:
             with torch.no_grad():
@@ -198,8 +329,12 @@ class GrowableTwistorLNN(nn.Module):
                 mask_imag = (
                     torch.rand(self.hidden_dim, self.hidden_dim) > self.sparsity
                 ).float()
-                self.sparse_mask_real.copy_(mask_real)
-                self.sparse_mask_imag.copy_(mask_imag)
+                self.sparse_mask_real.data[: self.hidden_dim, : self.hidden_dim].copy_(
+                    mask_real * 4 - 5
+                )
+                self.sparse_mask_imag.data[: self.hidden_dim, : self.hidden_dim].copy_(
+                    mask_imag * 4 - 5
+                )
 
     def _init_mobius_resonance(
         self,
@@ -232,19 +367,65 @@ class GrowableTwistorLNN(nn.Module):
                 device=str(self.U.weight.device),
             )
 
+    def _init_manifold_geometry(self):
+        """初始化流形几何约束系统"""
+        from .manifold_geometry import (
+            ManifoldGeometry,
+            ManifoldWeightInitializer,
+            GeodesicGrowthPlanner,
+        )
+
+        max_h = self.growth_config.max_hidden_dim
+        twist_rate = math.pi
+        klein_mix = 0.0
+
+        if self.mobius is not None:
+            twist_rate = (
+                self.mobius.twist_rate.item()
+                if hasattr(self.mobius, "twist_rate")
+                else math.pi
+            )
+            klein_mix = torch.sigmoid(self.mobius.klein_weight).item()
+
+        self.manifold_geometry = ManifoldGeometry(
+            max_dim=max_h,
+            manifold_radius=1.0,
+            twist_rate=twist_rate,
+            klein_mix=klein_mix,
+        )
+
+        twist_tensor = None
+        if self.mobius is not None:
+            try:
+                twist_tensor = self.mobius.compute_twist_tensor(
+                    min(max_h, 64),
+                    self.mobius.compute_manifold_dimension(min(max_h, 64)),
+                )
+            except Exception:
+                pass
+
+        self.weight_initializer = ManifoldWeightInitializer(
+            self.manifold_geometry, twist_tensor
+        )
+
+        self.growth_planner = GeodesicGrowthPlanner(self.manifold_geometry)
+
     def compute_tau(self, z: torch.Tensor) -> torch.Tensor:
         if self.hidden_dim == 0:
             return torch.ones_like(z.real) * self.tau_min
 
-        z_mod = torch.abs(z)
+        z_mod = torch.abs(z)[:, : self.hidden_dim]
 
-        if self.W_tau.weight.shape[0] == 0:
-            return torch.ones_like(z_mod) * self.tau_min
-
-        tau = F.sigmoid(self.W_tau(z_mod))
+        tau = F.sigmoid(
+            F.linear(
+                z_mod,
+                self.W_tau.weight[: self.hidden_dim, : self.hidden_dim],
+                self.W_tau.bias[: self.hidden_dim],
+            )
+        )
 
         if self.multi_scale_tau and self.tau_bias is not None:
-            tau = tau + self.tau_bias.unsqueeze(0)
+            tau = tau + self.tau_bias[: self.hidden_dim].unsqueeze(0)
 
         tau = torch.clamp(tau, self.tau_min, self.tau_max)
         return tau + 1e-6
@@ -259,17 +440,17 @@ class GrowableTwistorLNN(nn.Module):
         tanh_real = torch.tanh(z_real)
         tanh_imag = torch.tanh(z_imag)
 
-        W_real_sparse = self.W_real.weight * torch.sigmoid(
-            self.sparse_mask_real[: self.hidden_dim, : self.hidden_dim]
-        )
-        W_imag_sparse = self.W_imag.weight * torch.sigmoid(
-            self.sparse_mask_imag[: self.hidden_dim, : self.hidden_dim]
-        )
+        W_real_sparse = self.W_real.weight[
+            : self.hidden_dim, : self.hidden_dim
+        ] * torch.sigmoid(self.sparse_mask_real[: self.hidden_dim, : self.hidden_dim])
+        W_imag_sparse = self.W_imag.weight[
+            : self.hidden_dim, : self.hidden_dim
+        ] * torch.sigmoid(self.sparse_mask_imag[: self.hidden_dim, : self.hidden_dim])
 
         W_tanh_real = F.linear(tanh_real, W_real_sparse)
         W_tanh_imag = F.linear(tanh_imag, W_imag_sparse)
 
-        Ux = self.U(x)
+        Ux = self.U(x)[:, : self.hidden_dim]
 
         dz_real = -z_real + W_tanh_real + Ux + self.b_real[: self.hidden_dim]
         dz_imag = -z_imag + W_tanh_imag + Ux + self.b_imag[: self.hidden_dim]
@@ -327,7 +508,7 @@ class GrowableTwistorLNN(nn.Module):
                 self._activation_buffer.append(torch.abs(z).mean(dim=0).detach().cpu())
 
             y_t = (
-                self.out(z.real)
+                F.linear(z.real, self.out.weight[:, : self.hidden_dim], self.out.bias)
                 if self.hidden_dim > 0
                 else torch.zeros(B, self.output_dim, device=x.device)
             )
@@ -346,7 +527,13 @@ class GrowableTwistorLNN(nn.Module):
         if self.hidden_dim == 0 or len(self._activation_buffer) < 10:
             return
 
-        buffer = torch.stack(self._activation_buffer[-50:])
+        valid_buffer = [
+            b for b in self._activation_buffer if b.shape[0] == self.hidden_dim
+        ]
+        if len(valid_buffer) < 5:
+            return
+
+        buffer = torch.stack(valid_buffer[-50:])
 
         input_offset = self.input_dim
         output_offset = self.input_dim + self.output_dim
@@ -359,6 +546,75 @@ class GrowableTwistorLNN(nn.Module):
             self.neuron_states[state_idx].activation_mean = acts.mean().item()
             self.neuron_states[state_idx].activation_variance = acts.var().item()
             self.neuron_states[state_idx].usage_count += len(acts)
+            current_peak = acts.max().item()
+            if current_peak > self.neuron_states[state_idx].peak_activation:
+                self.neuron_states[state_idx].peak_activation = current_peak
+            self.neuron_states[state_idx].recent_activity = (
+                acts[-1].item() if len(acts) > 0 else 0.0
+            )
+
+    def _update_neuron_decay_consolidation(self):
+        if self.hidden_dim == 0:
+            return
+
+        input_offset = self.input_dim
+        output_offset = self.input_dim + self.output_dim
+        phase = self._get_current_developmental_phase()
+
+        for i in range(self.hidden_dim):
+            state_idx = output_offset + i
+            if state_idx >= len(self.neuron_states):
+                continue
+            state = self.neuron_states[state_idx]
+            if not state.active:
+                continue
+
+            state.life_span += 1
+
+            activity_signal = state.activation_mean * 0.6 + state.recent_activity * 0.4
+            if activity_signal > 0.2:
+                state.consolidation_score += (
+                    self.growth_config.consolidation_rate
+                    * activity_signal
+                    * phase.plasticity
+                )
+                state.decay_counter = max(
+                    0, state.decay_counter - phase.growth_rate * 0.5
+                )
+            else:
+                state.decay_counter += phase.prune_rate
+                if phase.prune_rate > 0.1:
+                    state.consolidation_score *= 0.95
+
+            state.consolidation_score = min(1.0, max(0.0, state.consolidation_score))
+            state.decay_counter = max(0.0, state.decay_counter)
+
+    def _get_current_developmental_phase(self) -> DevelopmentalPhase:
+        if (
+            not self.growth_config.enable_developmental_schedule
+            or not self.growth_config.developmental_phases
+        ):
+            return DevelopmentalPhase(
+                name="default",
+                start_step=0,
+                end_step=99999,
+                target_neurons=32,
+                target_connections_per_neuron=3,
+                growth_rate=0.1,
+                prune_rate=0.05,
+                plasticity=0.5,
+                description="默认阶段",
+            )
+
+        for phase in self.growth_config.developmental_phases:
+            if phase.start_step <= self.training_step < phase.end_step:
+                return phase
+
+        return self.growth_config.developmental_phases[-1]
+
+    def _get_phase_growth_multiplier(self) -> float:
+        phase = self._get_current_developmental_phase()
+        return phase.growth_rate
 
     def compute_importance_scores(self) -> torch.Tensor:
         scores = torch.zeros(self.hidden_dim)
@@ -392,6 +648,8 @@ class GrowableTwistorLNN(nn.Module):
 
         input_offset = self.input_dim
         output_offset = self.input_dim + self.output_dim
+        phase = self._get_current_developmental_phase()
+        variance_threshold = 0.15 if phase.plasticity > 0.7 else 0.3
 
         for i in range(self.hidden_dim):
             state_idx = output_offset + i
@@ -401,7 +659,7 @@ class GrowableTwistorLNN(nn.Module):
             if not state.active:
                 continue
 
-            if state.activation_variance > 0.3:
+            if state.activation_variance > variance_threshold:
                 overloaded.append(i)
 
         return overloaded
@@ -412,69 +670,13 @@ class GrowableTwistorLNN(nn.Module):
         return self._next_innovation - 1
 
     def _expand_parameters(self, new_dim: int):
-        """Expand parameters from old_dim to new_dim"""
-        old_dim = self.hidden_dim
+        """O(1)操作 - 参数已预分配,只需更新hidden_dim计数"""
+        pass
 
-        with torch.no_grad():
-            new_W_real = torch.zeros(new_dim, new_dim)
-            new_W_imag = torch.zeros(new_dim, new_dim)
-            new_W_tau = torch.zeros(new_dim, new_dim)
-            new_mask_real = torch.ones(new_dim, new_dim) * -5
-            new_mask_imag = torch.ones(new_dim, new_dim) * -5
-
-            if old_dim > 0:
-                new_W_real[:old_dim, :old_dim] = self.W_real.weight.data
-                new_W_imag[:old_dim, :old_dim] = self.W_imag.weight.data
-                new_W_tau[:old_dim, :old_dim] = self.W_tau.weight.data
-                new_mask_real[:old_dim, :old_dim] = self.sparse_mask_real.data[
-                    :old_dim, :old_dim
-                ]
-                new_mask_imag[:old_dim, :old_dim] = self.sparse_mask_imag.data[
-                    :old_dim, :old_dim
-                ]
-                new_mask_imag[:old_dim, :old_dim] = self.sparse_mask_imag.data[
-                    :old_dim, :old_dim
-                ]
-
-            self.W_real = nn.Linear(new_dim, new_dim, bias=False)
-            self.W_imag = nn.Linear(new_dim, new_dim, bias=False)
-            self.W_tau = nn.Linear(new_dim, new_dim)
-            if new_dim > 0:
-                self.W_real.weight.data = new_W_real
-                self.W_imag.weight.data = new_W_imag
-                self.W_tau.weight.data = new_W_tau
-
-            self.sparse_mask_real = nn.Parameter(new_mask_real)
-            self.sparse_mask_imag = nn.Parameter(new_mask_imag)
-
-            new_b_real = torch.zeros(new_dim)
-            new_b_imag = torch.zeros(new_dim)
-            if old_dim > 0:
-                new_b_real[:old_dim] = self.b_real.data[:old_dim]
-                new_b_imag[:old_dim] = self.b_imag.data[:old_dim]
-            self.b_real = nn.Parameter(new_b_real)
-            self.b_imag = nn.Parameter(new_b_imag)
-
-            if self.tau_bias is not None:
-                new_tau = torch.zeros(new_dim)
-                if old_dim > 0:
-                    new_tau[:old_dim] = self.tau_bias.data[:old_dim]
-                self.tau_bias = nn.Parameter(new_tau)
-
-            new_out = nn.Linear(new_dim, self.output_dim)
-            if old_dim > 0:
-                new_out.weight.data[:, :old_dim] = self.out.weight.data[:, :old_dim]
-                new_out.bias.data = self.out.bias.data
-            self.out = new_out
-
-            new_U = nn.Linear(self.input_dim, new_dim)
-            if old_dim > 0:
-                new_U.weight.data[:old_dim, :] = self.U.weight.data[:old_dim, :]
-                new_U.bias.data[:old_dim] = self.U.bias.data[:old_dim]
-            self.U = new_U
-
-    def add_connection(self, in_node: int, out_node: int) -> bool:
-        """添加新连接 - NEAT Add Connection Mutation"""
+    def add_connection(
+        self, in_node: int, out_node: int, manifold_weight: Optional[float] = None
+    ) -> bool:
+        """添加新连接 - NEAT Add Connection Mutation (流形约束版本)"""
         if in_node < 0 or out_node < 0:
             return False
         if in_node >= self.input_dim + self.output_dim + self.hidden_dim:
@@ -508,7 +710,10 @@ class GrowableTwistorLNN(nn.Module):
         else:
             return False
 
-        weight = torch.randn(1).item() * 0.5
+        if manifold_weight is not None:
+            weight = manifold_weight
+        else:
+            weight = torch.randn(1).item() * 0.5
 
         gene = ConnectionGene(
             in_node=in_node,
@@ -588,7 +793,23 @@ class GrowableTwistorLNN(nn.Module):
                 parent_connections.append((i, gene))
 
         if len(parent_connections) == 0:
-            return -1
+            for i, gene in enumerate(self.connection_genes):
+                if gene.in_node == parent_node and gene.enabled:
+                    parent_connections.append((i, gene))
+
+        if len(parent_connections) == 0:
+            if self.hidden_dim == 1:
+                gene = ConnectionGene(
+                    in_node=torch.randint(self.input_dim, (1,)).item(),
+                    out_node=parent_node,
+                    weight=torch.randn(1).item() * 0.5,
+                    enabled=True,
+                    innovation=self._get_next_innovation(),
+                )
+                self.connection_genes.append(gene)
+                parent_connections.append((len(self.connection_genes) - 1, gene))
+            else:
+                return -1
 
         gene_idx, parent_gene = parent_connections[0]
 
@@ -618,10 +839,21 @@ class GrowableTwistorLNN(nn.Module):
         with torch.no_grad():
             self._expand_parameters(new_dim)
 
+            parent_state = self._get_neuron_manifold_state(parent_idx)
+
             in_idx = parent_gene.in_node - input_offset
             if in_idx >= 0 and in_idx < old_dim:
-                self.W_real.weight.data[new_idx, in_idx] = 1.0
-                self.W_imag.weight.data[new_idx, in_idx] = 1.0
+                if self.growth_planner is not None:
+                    new_state = self.growth_planner.plan_new_neuron(
+                        self._get_all_neuron_states(), parent_idx
+                    )
+                    manifold_weight = new_state.norm().item()
+                    init_scale = max(0.1, min(manifold_weight, 1.0))
+                else:
+                    init_scale = 1.0
+
+                self.W_real.weight.data[new_idx, in_idx] = init_scale
+                self.W_imag.weight.data[new_idx, in_idx] = init_scale
 
                 self.sparse_mask_real.data[new_idx, in_idx] = 2.0
                 self.sparse_mask_imag.data[new_idx, in_idx] = 2.0
@@ -635,17 +867,36 @@ class GrowableTwistorLNN(nn.Module):
             else:
                 in_input_idx = parent_gene.in_node
                 if in_input_idx < self.input_dim:
-                    self.U.weight.data[new_idx, in_input_idx] = 1.0
+                    if self.weight_initializer is not None and parent_state is not None:
+                        weight, _ = self.weight_initializer.init_connection_weight(
+                            parent_state, parent_state, device=str(parent_state.device)
+                        )
+                        init_val = weight.norm().item() * 0.5
+                    else:
+                        init_val = 1.0
+                    self.U.weight.data[new_idx, in_input_idx] = init_val
                     self.out.weight.data[:, new_idx] = torch.tensor(
                         [parent_gene.weight] * self.output_dim
                     )
 
-            self.b_real.data[new_idx] = (
-                self.b_real.data[parent_idx] + torch.randn(1).item() * 0.1
-            )
-            self.b_imag.data[new_idx] = (
-                self.b_imag.data[parent_idx] + torch.randn(1).item() * 0.1
-            )
+            if parent_state is not None:
+                self.b_real.data[new_idx] = self.b_real.data[parent_idx] + (
+                    torch.randn(1).item()
+                    * 0.05
+                    * self.manifold_geometry.manifold_radius.abs().item()
+                )
+                self.b_imag.data[new_idx] = self.b_imag.data[parent_idx] + (
+                    torch.randn(1).item()
+                    * 0.05
+                    * self.manifold_geometry.manifold_radius.abs().item()
+                )
+            else:
+                self.b_real.data[new_idx] = (
+                    self.b_real.data[parent_idx] + torch.randn(1).item() * 0.1
+                )
+                self.b_imag.data[new_idx] = (
+                    self.b_imag.data[parent_idx] + torch.randn(1).item() * 0.1
+                )
 
             if self.tau_bias is not None:
                 self.tau_bias.data[new_idx] = self.tau_bias.data[parent_idx]
@@ -708,6 +959,95 @@ class GrowableTwistorLNN(nn.Module):
         in_node, out_node = candidates[torch.randint(len(candidates), (1,)).item()]
         return self.add_connection(in_node, out_node)
 
+    def add_batch_connections(self, n: int) -> int:
+        """批量添加连接 - 用于连接爆炸期
+
+        流形约束版本: 权重沿测地线方向初始化
+        """
+        if self.hidden_dim == 0:
+            return 0
+
+        input_offset = self.input_dim + self.output_dim
+        added = 0
+
+        all_states = self._get_all_neuron_states()
+
+        for _ in range(n * 3):
+            if added >= n:
+                break
+
+            conn_type = torch.randint(3, (1,)).item()
+
+            if conn_type == 0:
+                in_node = torch.randint(self.input_dim, (1,)).item()
+                out_node = input_offset + torch.randint(self.hidden_dim, (1,)).item()
+            elif conn_type == 1:
+                in_node = input_offset + torch.randint(self.hidden_dim, (1,)).item()
+                out_node = input_offset + torch.randint(self.hidden_dim, (1,)).item()
+                if in_node == out_node:
+                    continue
+            else:
+                in_node = input_offset + torch.randint(self.hidden_dim, (1,)).item()
+                out_node = self.input_dim + torch.randint(self.output_dim, (1,)).item()
+
+            exists = any(
+                g.in_node == in_node and g.out_node == out_node and g.enabled
+                for g in self.connection_genes
+            )
+            if not exists:
+                weight = None
+                if self.weight_initializer is not None and all_states is not None:
+                    in_idx = in_node - input_offset if in_node >= input_offset else 0
+                    out_idx = out_node - input_offset if out_node >= input_offset else 0
+                    if 0 <= in_idx < len(all_states) and 0 <= out_idx < len(all_states):
+                        w, _ = self.weight_initializer.init_connection_weight(
+                            all_states[in_idx],
+                            all_states[out_idx],
+                            device=str(all_states[in_idx].device),
+                        )
+                        weight = w.norm().item() * 0.5
+
+                if self.add_connection(in_node, out_node, manifold_weight=weight):
+                    added += 1
+
+        return added
+
+    def _get_neuron_manifold_state(self, neuron_idx: int) -> Optional[torch.Tensor]:
+        """获取神经元在流形上的状态表示"""
+        if self.hidden_dim == 0 or neuron_idx >= self.hidden_dim:
+            return None
+
+        r = self.manifold_geometry.manifold_radius.abs().item()
+        theta = 2 * math.pi * neuron_idx / max(1, self.hidden_dim)
+        phi = self.b_real.data[neuron_idx].item() * 0.1
+
+        state = torch.tensor(
+            [
+                r * math.cos(theta),
+                r * math.sin(theta),
+                phi,
+            ],
+            dtype=torch.float32,
+        )
+
+        return state
+
+    def _get_all_neuron_states(self) -> Optional[torch.Tensor]:
+        """获取所有神经元的流形状态"""
+        if self.hidden_dim == 0:
+            return None
+
+        states = []
+        for i in range(self.hidden_dim):
+            s = self._get_neuron_manifold_state(i)
+            if s is not None:
+                states.append(s)
+
+        if not states:
+            return None
+
+        return torch.stack(states, dim=0)
+
     def disable_random_connection(self) -> bool:
         """随机禁用连接 - NEAT Disable Connection Mutation"""
         enabled_connections = [
@@ -746,29 +1086,44 @@ class GrowableTwistorLNN(nn.Module):
         return True
 
     def prune_neurons(self) -> int:
-        """剪枝不重要的神经元"""
+        """剪枝不重要的神经元 - 基于衰减和巩固分数"""
         if self.hidden_dim == 0:
             return 0
 
-        importance = self.compute_importance_scores()
-
-        active_importance = [(i, importance[i]) for i in range(self.hidden_dim)]
-        active_importance.sort(key=lambda x: x[1])
-
-        n_prune = min(
-            2,
-            self.hidden_dim - self.growth_config.min_hidden_dim,
-        )
-
-        if n_prune <= 0:
+        phase = self._get_current_developmental_phase()
+        if phase.prune_rate < 0.05:
             return 0
 
         input_offset = self.input_dim + self.output_dim
         pruned = 0
+
+        candidates = []
+        for i in range(self.hidden_dim):
+            state_idx = input_offset + i
+            if state_idx >= len(self.neuron_states):
+                continue
+            state = self.neuron_states[state_idx]
+            if not state.active:
+                continue
+
+            survival_score = state.consolidation_score * 0.5 - state.decay_counter * 0.5
+            state.survival_threshold = survival_score
+            candidates.append((i, survival_score))
+
+        candidates.sort(key=lambda x: x[1])
+
+        n_prune = max(1, int(self.hidden_dim * phase.prune_rate))
+        n_prune = min(n_prune, self.hidden_dim - self.growth_config.min_hidden_dim)
+
+        if n_prune <= 0:
+            return 0
+
+        n_prune = min(n_prune, len(candidates))
+
         for i in range(n_prune):
-            idx = active_importance[i][0]
-            state_idx = input_offset + idx
-            if state_idx < len(self.neuron_states):
+            idx, score = candidates[i]
+            if score < self.growth_config.survival_threshold:
+                state_idx = input_offset + idx
                 self.neuron_states[state_idx].active = False
                 pruned += 1
 
@@ -823,48 +1178,26 @@ class GrowableTwistorLNN(nn.Module):
         if self.hidden_dim != 0:
             return -1
 
-        new_dim = 1
-
         with torch.no_grad():
-            new_W_real = torch.zeros(1, 1)
-            new_W_imag = torch.zeros(1, 1)
-            new_mask_real = torch.ones(1, 1) * 2.0
-            new_mask_imag = torch.ones(1, 1) * 2.0
-
-            self.W_real = nn.Linear(1, 1, bias=False)
-            self.W_imag = nn.Linear(1, 1, bias=False)
-            self.W_tau = nn.Linear(1, 1)
-            nn.init.orthogonal_(self.W_real.weight, gain=0.5)
-            nn.init.orthogonal_(self.W_imag.weight, gain=0.5)
-            nn.init.orthogonal_(self.W_tau.weight, gain=0.1)
-            nn.init.zeros_(self.W_tau.bias)
-            self.W_real.weight.data = new_W_real
-            self.W_imag.weight.data = new_W_imag
-
-            self.sparse_mask_real = nn.Parameter(new_mask_real)
-            self.sparse_mask_imag = nn.Parameter(new_mask_imag)
-
-            new_b_real = torch.zeros(1)
-            new_b_imag = torch.zeros(1)
-            self.b_real = nn.Parameter(new_b_real)
-            self.b_imag = nn.Parameter(new_b_imag)
-
+            self.W_real.weight.data[0, 0] = 0.0
+            self.W_imag.weight.data[0, 0] = 0.0
+            self.sparse_mask_real.data[0, 0] = 2.0
+            self.sparse_mask_imag.data[0, 0] = 2.0
+            self.W_tau.weight.data[0, 0] = 0.1
+            self.b_real.data[0] = 0.0
+            self.b_imag.data[0] = 0.0
             if self.tau_bias is not None:
-                self.tau_bias = nn.Parameter(torch.zeros(1))
-
-            new_out = nn.Linear(1, self.output_dim)
-            self.out = new_out
+                self.tau_bias.data[0] = 0.0
 
         input_offset = self.input_dim + self.output_dim
 
         U_weight = torch.randn(1, self.input_dim) * 0.5
-        self.U = nn.Linear(self.input_dim, 1)
-        self.U.weight.data = U_weight
+        self.U.weight.data[0, :] = U_weight
+        self.U.bias.data[0] = 0.0
 
         out_weight = torch.randn(self.output_dim, 1) * 0.5
-        self.out = nn.Linear(1, self.output_dim)
-        self.out.weight.data = out_weight
-        self.out.bias.data = torch.zeros(self.output_dim)
+        self.out.weight.data[:, 0] = out_weight.squeeze()
+        self.out.bias.data[:] = 0.0
 
         for in_node in range(self.input_dim):
             for out_node in range(self.input_dim, self.input_dim + self.output_dim):
@@ -900,19 +1233,28 @@ class GrowableTwistorLNN(nn.Module):
         )
 
         self.active_neurons.append(input_offset)
-        self.hidden_dim = new_dim
+        self.hidden_dim = 1
 
         return 0
 
     def growth_step(self):
-        """执行一步增长/剪枝 - NEAT风格的突变操作"""
+        """执行一步增长/剪枝 - 大脑发育时间表驱动"""
         if not self.enable_growth:
             return {"action": "disabled", "changes": 0}
 
         self.training_step += 1
         self._update_neuron_stats()
+        self._update_neuron_decay_consolidation()
 
-        if self.training_step % self.growth_config.growth_interval == 0:
+        phase = self._get_current_developmental_phase()
+        effective_growth_interval = max(
+            1, int(self.growth_config.growth_interval / max(0.05, phase.growth_rate))
+        )
+        effective_prune_interval = max(
+            1, int(self.growth_config.prune_interval / max(0.05, phase.prune_rate))
+        )
+
+        if self.training_step % effective_growth_interval == 0:
             action_taken = None
             changes = 0
 
@@ -922,28 +1264,34 @@ class GrowableTwistorLNN(nn.Module):
                 if new_idx >= 0:
                     return {
                         "action": "init",
+                        "phase": phase.name,
                         "count": 1,
                         "new_dim": self.hidden_dim,
                     }
 
             if self.hidden_dim > 0:
-                rand_val = torch.rand(1).item()
+                input_offset = self.input_dim + self.output_dim
+                active_hidden_count = sum(
+                    1
+                    for i in range(self.hidden_dim)
+                    if input_offset + i < len(self.neuron_states)
+                    and self.neuron_states[input_offset + i].active
+                )
 
-                if rand_val < self.growth_config.prob_add_node:
-                    overloaded = self.get_overloaded_neurons()
-                    if overloaded:
-                        parent = overloaded[torch.randint(len(overloaded), (1,)).item()]
-                        new_idx = self.split_neuron(parent)
-                        if new_idx >= 0:
-                            action_taken = "split"
-                            changes = 1
+                neuron_gap = phase.target_neurons - active_hidden_count
+                burst_count = max(
+                    1,
+                    min(
+                        int(neuron_gap * 0.3),
+                        max(active_hidden_count * 2, 10),
+                        self.growth_config.max_hidden_dim - self.hidden_dim,
+                    ),
+                )
 
-                elif self.hidden_dim < self.growth_config.max_hidden_dim:
-                    if self.add_random_connection():
-                        action_taken = "add_connection"
-                        changes = 1
-                    elif torch.rand(1).item() < 0.5:
-                        self._update_neuron_stats()
+                if neuron_gap > 0 and phase.growth_rate > 0.1:
+                    for _ in range(burst_count):
+                        if self.hidden_dim >= self.growth_config.max_hidden_dim:
+                            break
                         overloaded = self.get_overloaded_neurons()
                         if overloaded:
                             parent = overloaded[
@@ -951,19 +1299,48 @@ class GrowableTwistorLNN(nn.Module):
                             ]
                             new_idx = self.split_neuron(parent)
                             if new_idx >= 0:
-                                action_taken = "split"
-                                changes = 1
+                                action_taken = "split_burst"
+                                changes += 1
+                        else:
+                            active_hidden = [
+                                i
+                                for i in range(self.hidden_dim)
+                                if input_offset + i < len(self.neuron_states)
+                                and self.neuron_states[input_offset + i].active
+                            ]
+                            if active_hidden:
+                                parent = active_hidden[
+                                    torch.randint(len(active_hidden), (1,)).item()
+                                ]
+                                new_idx = self.split_neuron(parent)
+                                if new_idx >= 0:
+                                    action_taken = "split_dev"
+                                    changes += 1
+
+                conn_per_neuron = self._get_avg_connections_per_neuron()
+                conn_gap = phase.target_connections_per_neuron - conn_per_neuron
+                if conn_gap > 0 and phase.growth_rate > 0:
+                    conn_burst = max(
+                        1, int(conn_gap * phase.growth_rate * self.hidden_dim * 0.5)
+                    )
+                    conn_burst = min(conn_burst, 500)
+                    added = self.add_batch_connections(conn_burst)
+                    if added > 0:
+                        if action_taken is None:
+                            action_taken = "add_connection"
+                        changes += added
 
             if action_taken:
                 if self.mobius is not None:
                     self.mobius.on_dimension_change(self.hidden_dim)
                 return {
                     "action": action_taken,
+                    "phase": phase.name,
                     "count": changes,
                     "new_dim": self.hidden_dim,
                 }
 
-        if self.training_step % self.growth_config.prune_interval == 0:
+        if self.training_step % effective_prune_interval == 0:
             n_pruned = self.prune_neurons()
             n_connections = (
                 self.prune_connections()
@@ -974,11 +1351,18 @@ class GrowableTwistorLNN(nn.Module):
             if n_pruned > 0 or n_connections > 0:
                 return {
                     "action": "prune",
+                    "phase": phase.name,
                     "neurons": n_pruned,
                     "connections": n_connections,
                 }
 
-        return {"action": "none", "changes": 0}
+        return {"action": "none", "phase": phase.name, "changes": 0}
+
+    def _get_avg_connections_per_neuron(self) -> float:
+        if self.hidden_dim == 0:
+            return 0.0
+        enabled = sum(1 for g in self.connection_genes if g.enabled)
+        return enabled / max(1, self.hidden_dim)
 
     def force_grow_to(self, target_dim: int):
         """
@@ -1023,6 +1407,18 @@ class GrowableTwistorLNN(nn.Module):
             importance[importance > 0].tolist() if self.hidden_dim > 0 else []
         )
 
+        manifold_info = {}
+        if self.manifold_geometry is not None:
+            manifold_info = {
+                "manifold_radius": self.manifold_geometry.manifold_radius.item(),
+                "twist_rate": self.manifold_geometry.twist_rate.item(),
+                "klein_mix": self.manifold_geometry.klein_mix.item(),
+            }
+
+        if self.mobius is not None:
+            mobius_info = self.mobius.get_manifold_info(self.hidden_dim)
+            manifold_info.update(mobius_info)
+
         return {
             "hidden_dim": self.hidden_dim,
             "active_count": len([s for s in self.neuron_states if s.active]),
@@ -1030,7 +1426,17 @@ class GrowableTwistorLNN(nn.Module):
             "connection_count": len([g for g in self.connection_genes if g.enabled]),
             "importance_mean": np.mean(active_importance) if active_importance else 0.0,
             "enable_growth": self.enable_growth,
+            **manifold_info,
         }
+
+    def create_riemannian_optimizer(
+        self, optimizer_class=torch.optim.Adam, **optimizer_kwargs
+    ):
+        """创建黎曼优化器 - 梯度自动投影到流形切空间"""
+        from .manifold_geometry import RiemannianOptimizer
+
+        optimizer = optimizer_class(self.parameters(), **optimizer_kwargs)
+        return RiemannianOptimizer(optimizer, self.manifold_geometry)
 
     def reset_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
         return torch.zeros(
