@@ -160,7 +160,7 @@ class MobiusConstraint(nn.Module):
 
         twist = alpha * twist_mobius + beta * twist_klein
 
-        self._twist_tensor = twist
+        self._twist_tensor = twist.detach()
         self._twist_dirty = False
         self._last_hidden_dim = hidden_dim
         self._last_manifold_dim = manifold_dim
@@ -227,7 +227,7 @@ class MobiusConstraint(nn.Module):
             alpha * mobius_modulation + beta * torch.cos(2 * math.pi * d_norm)
         )
 
-        self._topo_cache = W_topo
+        self._topo_cache = W_topo.detach()
         self._topo_cache_N = N
 
         return W_topo

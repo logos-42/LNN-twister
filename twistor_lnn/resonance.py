@@ -103,7 +103,7 @@ class TwistorResonance(nn.Module):
         if topology_weights is not None and self.use_topology_mask:
             if self._topo_cache is None or self._topo_cache_N != N:
                 mask = (topology_weights.abs() > self.topology_threshold.abs()).float()
-                self._topo_cache = mask
+                self._topo_cache = mask.detach()
                 self._topo_cache_N = N
             else:
                 mask = self._topo_cache
