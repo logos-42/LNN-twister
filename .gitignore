@@ -42,4 +42,27 @@ Thumbs.db
 
 # Logs
 *.log
-".git_backup/"  
+
+# Git backup
+".git_backup/"
+
+# Datasets & cache
+*.jsonl
+*.json
+*.parquet
+*.arrow
+*.cache/
+.huggingface/
+datasets--*/
+
+# Download scripts
+download_*.py
+
+# Test scale scripts (large output)
+test_growth_scale.py
+
+# Checkpoints
+checkpoints/
+*.ckpt
+*.pt
+*.pth

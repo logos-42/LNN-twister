@@ -264,16 +264,29 @@ class GrowableTwistorLNN(nn.Module):
         self._max_buffer_size = 100
 
     def _preallocate_parameters(self):
-        """预分配最大尺寸参数 - 避免增长时O(n²)重建"""
+        """预分配参数 - 振幅+相位(流形约束)表示
+
+        权重表示:
+          W_ij = A_ij · exp(i·Θ_ij)
+          A_ij ∈ ℝ+  ← 振幅(自由学习)
+          Θ_ij = twist(θ_i, θ_j)  ← 相位(由流形坐标决定)
+
+        优化: θ (N×3) + A (N×N)
+        约束: 相位自动受莫比乌斯几何约束
+        """
         max_h = self.growth_config.max_hidden_dim
 
-        self.W_real = nn.Linear(max_h, max_h, bias=False)
-        self.W_imag = nn.Linear(max_h, max_h, bias=False)
+        # 流形坐标 (每个神经元 3 维: θ, φ, twist_offset)
+        self.manifold_theta = nn.Parameter(torch.randn(max_h, 3) * 0.1)
+
+        # 振幅矩阵 (替代 W_real + W_imag)
+        self.W_amplitude = nn.Parameter(torch.randn(max_h, max_h) * 0.5)
+
+        # 输入/输出层 (保持实数)
         self.U = nn.Linear(self.input_dim, max_h)
         self.W_tau = nn.Linear(max_h, max_h)
 
-        self.sparse_mask_real = nn.Parameter(torch.ones(max_h, max_h) * -5)
-        self.sparse_mask_imag = nn.Parameter(torch.ones(max_h, max_h) * -5)
+        self.sparse_mask = nn.Parameter(torch.ones(max_h, max_h) * -5)
 
         if self.multi_scale_tau:
             self.tau_bias = nn.Parameter(torch.zeros(max_h))
@@ -286,12 +299,6 @@ class GrowableTwistorLNN(nn.Module):
         self.out = nn.Linear(max_h, self.output_dim)
 
         if self.hidden_dim > 0:
-            nn.init.orthogonal_(
-                self.W_real.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
-            )
-            nn.init.orthogonal_(
-                self.W_imag.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
-            )
             nn.init.orthogonal_(self.U.weight[: self.hidden_dim, :], gain=0.5)
             nn.init.orthogonal_(
                 self.W_tau.weight[: self.hidden_dim, : self.hidden_dim], gain=0.1
@@ -302,39 +309,94 @@ class GrowableTwistorLNN(nn.Module):
         nn.init.zeros_(self.b_real)
         nn.init.zeros_(self.b_imag)
 
+        # 初始化流形坐标 (均匀分布在环上)
+        if self.hidden_dim > 0:
+            for i in range(self.hidden_dim):
+                theta = 2 * math.pi * i / max(1, self.hidden_dim)
+                self.manifold_theta.data[i, 0] = theta
+                self.manifold_theta.data[i, 1] = 0.0
+                self.manifold_theta.data[i, 2] = 0.0
+
     def _init_parameters(self):
         """兼容旧接口 - 使用预分配"""
         self._preallocate_parameters()
 
     def _init_weights(self):
+        """初始化权重 - 振幅+相位"""
         if self.hidden_dim > 0:
-            nn.init.orthogonal_(
-                self.W_real.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
-            )
-            nn.init.orthogonal_(
-                self.W_imag.weight[: self.hidden_dim, : self.hidden_dim], gain=0.5
-            )
             nn.init.orthogonal_(self.U.weight[: self.hidden_dim, :], gain=0.5)
             nn.init.orthogonal_(
                 self.W_tau.weight[: self.hidden_dim, : self.hidden_dim], gain=0.1
             )
+
+            # 初始化振幅 (orthogonal)
+            amp = self.W_amplitude[: self.hidden_dim, : self.hidden_dim]
+            nn.init.orthogonal_(amp, gain=0.5)
+
         nn.init.zeros_(self.b_real[: self.hidden_dim])
         nn.init.zeros_(self.b_imag[: self.hidden_dim])
 
         if self.sparsity > 0 and self.hidden_dim > 0:
             with torch.no_grad():
-                mask_real = (
+                mask = (
                     torch.rand(self.hidden_dim, self.hidden_dim) > self.sparsity
                 ).float()
-                mask_imag = (
-                    torch.rand(self.hidden_dim, self.hidden_dim) > self.sparsity
-                ).float()
-                self.sparse_mask_real.data[: self.hidden_dim, : self.hidden_dim].copy_(
-                    mask_real * 4 - 5
+                self.sparse_mask.data[: self.hidden_dim, : self.hidden_dim].copy_(
+                    mask * 4 - 5
                 )
-                self.sparse_mask_imag.data[: self.hidden_dim, : self.hidden_dim].copy_(
-                    mask_imag * 4 - 5
-                )
+
+    def compute_twist_phase(self, n: int) -> torch.Tensor:
+        """
+        计算莫比乌斯扭转相位矩阵 Θ ∈ ℝ^(n×n)
+
+        Θ_ij = twist_rate · (θ_i + θ_j) / (2n) + klein_mix · (θ_i · θ_j) / n²
+
+        其中 θ_i 是神经元 i 的流形坐标
+        """
+        theta = self.manifold_theta[:n, 0]  # 取第一个维度作为角度
+
+        i = theta.unsqueeze(1)  # (n, 1)
+        j = theta.unsqueeze(0)  # (1, n)
+
+        # 莫比乌斯半扭转
+        twist_mobius = math.pi * (i + j) / (2 * max(n, 1))
+
+        # 克莱因全局扭转
+        twist_klein = 2 * math.pi * (i * j) / (max(n, 1) ** 2)
+
+        # 混合
+        if self.mobius is not None:
+            alpha = torch.sigmoid(self.mobius.mobius_weight)
+            beta = torch.sigmoid(self.mobius.klein_weight)
+        else:
+            alpha = torch.tensor(0.5)
+            beta = torch.tensor(0.5)
+
+        total = alpha + beta + 1e-6
+        phase = (alpha / total) * twist_mobius + (beta / total) * twist_klein
+
+        return phase
+
+    def get_complex_weight(self) -> torch.Tensor:
+        """
+        获取复数权重矩阵 W = A · exp(i·Θ)
+
+        W ∈ ℂ^(N×N), 由振幅和相位生成
+        """
+        n = self.hidden_dim
+        if n == 0:
+            return torch.zeros(0, 0, dtype=torch.complex64, device=self.b_real.device)
+
+        amp = self.W_amplitude[:n, :n]
+        phase = self.compute_twist_phase(n)
+
+        # 稀疏掩码
+        mask = torch.sigmoid(self.sparse_mask[:n, :n])
+
+        # 复数权重 = 振幅 × exp(i·相位) × 稀疏掩码
+        W_complex = amp * mask * torch.exp(1j * phase)
+
+        return W_complex
 
     def _init_mobius_resonance(
         self,
@@ -440,15 +502,16 @@ class GrowableTwistorLNN(nn.Module):
         tanh_real = torch.tanh(z_real)
         tanh_imag = torch.tanh(z_imag)
 
-        W_real_sparse = self.W_real.weight[
-            : self.hidden_dim, : self.hidden_dim
-        ] * torch.sigmoid(self.sparse_mask_real[: self.hidden_dim, : self.hidden_dim])
-        W_imag_sparse = self.W_imag.weight[
-            : self.hidden_dim, : self.hidden_dim
-        ] * torch.sigmoid(self.sparse_mask_imag[: self.hidden_dim, : self.hidden_dim])
+        # 复数权重 W = A · exp(i·Θ)
+        W_complex = self.get_complex_weight()
 
-        W_tanh_real = F.linear(tanh_real, W_real_sparse)
-        W_tanh_imag = F.linear(tanh_imag, W_imag_sparse)
+        # 复数矩阵乘法: W @ tanh(z)
+        # (Wr + iWi) @ (tr + i·ti) = (Wr@tr - Wi@ti) + i(Wr@ti + Wi@tr)
+        W_real = W_complex.real
+        W_imag = W_complex.imag
+
+        W_tanh_real = F.linear(tanh_real, W_real) - F.linear(tanh_imag, W_imag)
+        W_tanh_imag = F.linear(tanh_real, W_imag) + F.linear(tanh_imag, W_real)
 
         Ux = self.U(x)[:, : self.hidden_dim]
 
@@ -726,9 +789,8 @@ class GrowableTwistorLNN(nn.Module):
         return True
 
     def _apply_connection_gene(self, gene: ConnectionGene):
-        """应用连接基因到权重矩阵"""
+        """应用连接基因到振幅矩阵"""
         hidden_in_offset = self.input_dim + self.output_dim
-        hidden_out_offset = self.input_dim + self.output_dim
 
         if gene.in_node >= hidden_in_offset and gene.out_node >= hidden_in_offset:
             in_idx = gene.in_node - hidden_in_offset
@@ -740,11 +802,8 @@ class GrowableTwistorLNN(nn.Module):
                 and out_idx >= 0
                 and out_idx < self.hidden_dim
             ):
-                self.W_real.weight.data[out_idx, in_idx] = gene.weight
-                self.W_imag.weight.data[out_idx, in_idx] = -gene.weight
-
-                self.sparse_mask_real.data[out_idx, in_idx] = 2.0
-                self.sparse_mask_imag.data[out_idx, in_idx] = 2.0
+                self.W_amplitude.data[out_idx, in_idx] = abs(gene.weight)
+                self.sparse_mask.data[out_idx, in_idx] = 2.0
 
         elif gene.in_node < self.input_dim and gene.out_node >= hidden_in_offset:
             out_idx = gene.out_node - hidden_in_offset
@@ -847,20 +906,19 @@ class GrowableTwistorLNN(nn.Module):
                     manifold_weight = new_state.norm().item()
                     init_scale = max(0.1, min(manifold_weight, 1.0))
                 else:
-                    init_scale = 1.0
+                    init_scale = abs(parent_gene.weight)
 
-                self.W_real.weight.data[new_idx, in_idx] = init_scale
-                self.W_imag.weight.data[new_idx, in_idx] = init_scale
-
-                self.sparse_mask_real.data[new_idx, in_idx] = 2.0
-                self.sparse_mask_imag.data[new_idx, in_idx] = 2.0
+                self.W_amplitude.data[new_idx, in_idx] = init_scale
+                self.sparse_mask.data[new_idx, in_idx] = 2.0
 
                 out_idx = parent_idx
-                self.W_real.weight.data[out_idx, new_idx] = parent_gene.weight
-                self.W_imag.weight.data[out_idx, new_idx] = -parent_gene.weight
+                self.W_amplitude.data[out_idx, new_idx] = abs(parent_gene.weight)
+                self.sparse_mask.data[out_idx, new_idx] = 2.0
 
-                self.sparse_mask_real.data[out_idx, new_idx] = 2.0
-                self.sparse_mask_imag.data[out_idx, new_idx] = 2.0
+                # 流形坐标: 新神经元在父神经元附近
+                self.manifold_theta.data[new_idx] = (
+                    self.manifold_theta.data[parent_idx] + torch.randn(3) * 0.1
+                )
             else:
                 in_input_idx = parent_gene.in_node
                 if in_input_idx < self.input_dim:
@@ -870,7 +928,7 @@ class GrowableTwistorLNN(nn.Module):
                         )
                         init_val = weight.norm().item() * 0.5
                     else:
-                        init_val = 1.0
+                        init_val = abs(parent_gene.weight)
                     self.U.weight.data[new_idx, in_input_idx] = init_val
                     self.out.weight.data[:, new_idx] = torch.tensor(
                         [parent_gene.weight] * self.output_dim
@@ -1072,13 +1130,7 @@ class GrowableTwistorLNN(nn.Module):
                 and out_idx >= 0
                 and out_idx < self.hidden_dim
             ):
-                self.sparse_mask_real.data[out_idx, in_idx] = -10
-                self.sparse_mask_imag.data[out_idx, in_idx] = -10
-
-        elif gene.in_node < self.input_dim and gene.out_node >= hidden_in_offset:
-            out_idx = gene.out_node - hidden_in_offset
-            if out_idx >= 0 and out_idx < self.hidden_dim:
-                pass
+                self.sparse_mask.data[out_idx, in_idx] = -10
 
         return True
 
@@ -1132,28 +1184,15 @@ class GrowableTwistorLNN(nn.Module):
             return 0
 
         with torch.no_grad():
-            mask_real = torch.sigmoid(
-                self.sparse_mask_real[: self.hidden_dim, : self.hidden_dim]
-            )
-            mask_imag = torch.sigmoid(
-                self.sparse_mask_imag[: self.hidden_dim, : self.hidden_dim]
-            )
+            mask = torch.sigmoid(self.sparse_mask[: self.hidden_dim, : self.hidden_dim])
 
-            pruned_real = (
-                (mask_real < self.growth_config.connection_threshold).sum().item()
-            )
-            pruned_imag = (
-                (mask_imag < self.growth_config.connection_threshold).sum().item()
-            )
+            pruned = (mask < self.growth_config.connection_threshold).sum().item()
 
-            self.sparse_mask_real.data[: self.hidden_dim, : self.hidden_dim][
-                mask_real < self.growth_config.connection_threshold
-            ] = -10
-            self.sparse_mask_imag.data[: self.hidden_dim, : self.hidden_dim][
-                mask_imag < self.growth_config.connection_threshold
+            self.sparse_mask.data[: self.hidden_dim, : self.hidden_dim][
+                mask < self.growth_config.connection_threshold
             ] = -10
 
-        return int(pruned_real + pruned_imag)
+        return int(pruned)
 
     def compute_topology_penalty(self) -> torch.Tensor:
         """计算拓扑惩罚"""
@@ -1161,8 +1200,8 @@ class GrowableTwistorLNN(nn.Module):
             0.0, device=self.b_real.device if hasattr(self, "b_real") else "cpu"
         )
 
-        if hasattr(self, "sparse_mask_real") and self.hidden_dim > 0:
-            mask_sum = self.sparse_mask_real[: self.hidden_dim, : self.hidden_dim].sum()
+        if hasattr(self, "sparse_mask") and self.hidden_dim > 0:
+            mask_sum = self.sparse_mask[: self.hidden_dim, : self.hidden_dim].sum()
             target = self.hidden_dim * self.hidden_dim * 0.5
             penalty = (
                 penalty + abs(mask_sum - target) * self.growth_config.topology_penalty
@@ -1176,10 +1215,11 @@ class GrowableTwistorLNN(nn.Module):
             return -1
 
         with torch.no_grad():
-            self.W_real.weight.data[0, 0] = 0.0
-            self.W_imag.weight.data[0, 0] = 0.0
-            self.sparse_mask_real.data[0, 0] = 2.0
-            self.sparse_mask_imag.data[0, 0] = 2.0
+            self.W_amplitude.data[0, 0] = 0.0
+            self.sparse_mask.data[0, 0] = 2.0
+            self.manifold_theta.data[0, 0] = 0.0
+            self.manifold_theta.data[0, 1] = 0.0
+            self.manifold_theta.data[0, 2] = 0.0
             self.W_tau.weight.data[0, 0] = 0.1
             self.b_real.data[0] = 0.0
             self.b_imag.data[0] = 0.0
