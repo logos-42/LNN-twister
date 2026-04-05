@@ -398,6 +398,30 @@ class GrowableTwistorLNN(nn.Module):
 
         return W_complex
 
+    def compute_amplitude_regularization(
+        self, l1_weight: float = 0.01, l2_weight: float = 0.001
+    ) -> torch.Tensor:
+        """
+        振幅正则化 - 鼓励稀疏化
+
+        L1: 鼓励振幅趋零 (稀疏性)
+        L2: 防止振幅过大 (稳定性)
+
+        返回: regularization loss
+        """
+        if self.hidden_dim == 0:
+            return torch.tensor(0.0, device=self.b_real.device)
+
+        amp = self.W_amplitude[: self.hidden_dim, : self.hidden_dim]
+
+        # L1 正则化 (稀疏性)
+        l1_loss = amp.abs().mean()
+
+        # L2 正则化 (稳定性)
+        l2_loss = amp.pow(2).mean()
+
+        return l1_weight * l1_loss + l2_weight * l2_loss
+
     def _init_mobius_resonance(
         self,
         enable_mobius: bool = True,
