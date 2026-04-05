@@ -499,12 +499,9 @@ class GrowableTwistorLNN(nn.Module):
                 torch.clamp(z.imag, -self.z_max, self.z_max),
             )
 
-            if (
-                self.training
-                and self.enable_growth
-                and self.hidden_dim > 0
-                and len(self._activation_buffer) < self._max_buffer_size
-            ):
+            if self.training and self.enable_growth and self.hidden_dim > 0:
+                if len(self._activation_buffer) >= self._max_buffer_size:
+                    self._activation_buffer.pop(0)
                 self._activation_buffer.append(torch.abs(z).mean(dim=0).detach().cpu())
 
             y_t = (
@@ -572,7 +569,7 @@ class GrowableTwistorLNN(nn.Module):
             state.life_span += 1
 
             activity_signal = state.activation_mean * 0.6 + state.recent_activity * 0.4
-            if activity_signal > 0.2:
+            if activity_signal > 0.05:
                 state.consolidation_score += (
                     self.growth_config.consolidation_rate
                     * activity_signal
@@ -582,7 +579,7 @@ class GrowableTwistorLNN(nn.Module):
                     0, state.decay_counter - phase.growth_rate * 0.5
                 )
             else:
-                state.decay_counter += phase.prune_rate
+                state.decay_counter += phase.prune_rate * 0.1
                 if phase.prune_rate > 0.1:
                     state.consolidation_score *= 0.95
 
@@ -1320,15 +1317,20 @@ class GrowableTwistorLNN(nn.Module):
                 conn_per_neuron = self._get_avg_connections_per_neuron()
                 conn_gap = phase.target_connections_per_neuron - conn_per_neuron
                 if conn_gap > 0 and phase.growth_rate > 0:
-                    conn_burst = max(
-                        1, int(conn_gap * phase.growth_rate * self.hidden_dim * 0.5)
+                    max_conn = self.hidden_dim * min(
+                        phase.target_connections_per_neuron, 20
                     )
-                    conn_burst = min(conn_burst, 500)
-                    added = self.add_batch_connections(conn_burst)
-                    if added > 0:
-                        if action_taken is None:
-                            action_taken = "add_connection"
-                        changes += added
+                    current_conn = sum(1 for g in self.connection_genes if g.enabled)
+                    if current_conn < max_conn:
+                        conn_burst = max(
+                            1, int(conn_gap * phase.growth_rate * self.hidden_dim * 0.3)
+                        )
+                        conn_burst = min(conn_burst, 200)
+                        added = self.add_batch_connections(conn_burst)
+                        if added > 0:
+                            if action_taken is None:
+                                action_taken = "add_connection"
+                            changes += added
 
             if action_taken:
                 if self.mobius is not None:
